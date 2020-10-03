@@ -245,7 +245,6 @@ class DLRM_Net(nn.Module):
         md_flag=False,
         md_threshold=200,
         batched_emb=False,
-        batched_emb_L_max=38,
     ):
         super(DLRM_Net, self).__init__()
 
@@ -286,7 +285,6 @@ class DLRM_Net(nn.Module):
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
             # use table batched embedding
             self.batched_emb = batched_emb
-            self.batched_emb_L_max = batched_emb_L_max
 
     def apply_mlp(self, x, layers):
         # approach 1: use ModuleList
@@ -333,28 +331,16 @@ class DLRM_Net(nn.Module):
         indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int().cuda()
         E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
         offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]]).cuda()], dim=0).int().cuda()
-
-        return table_batched_embeddings.forward(
-            self.emb_l.embedding_weights,
-            self.emb_l.table_offsets,
-            indices,
-            offsets,
-            None,
-            self.batched_emb_L_max,
-            1,
-            True,
-        )
+        return self.emb_l(indices, offsets)
 
     def interact_features(self, x, ly):
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
             (batch_size, d) = x.shape
-            # print(x.shape)
-            # print(ly.shape)
-            if isinstance(ly, list):
-                T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
-            else:
+            if self.batched_emb:
                 T = torch.cat((x.view(batch_size, 1, d), ly), dim=1)
+            else:
+                T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
             # perform a dot product
             Z = torch.bmm(T, torch.transpose(T, 1, 2))
             # append dense feature with the interactions (into a row vector)
@@ -374,10 +360,10 @@ class DLRM_Net(nn.Module):
             R = torch.cat([x] + [Zflat], dim=1)
         elif self.arch_interaction_op == "cat":
             # concatenation features (into a row vector)
-            if isinstance(ly, list):
-                R = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
-            else:
+            if self.batched_emb:
                 R = torch.cat((x.view(batch_size, 1, d), ly), dim=1)
+            else:
+                R = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
         else:
             sys.exit(
                 "ERROR: --arch-interaction-op="
@@ -858,7 +844,6 @@ if __name__ == "__main__":
         md_flag=args.md_flag,
         md_threshold=args.md_threshold,
         batched_emb=args.batched_emb,
-        batched_emb_L_max=args.num_indices_per_lookup,
     )
     # test prints
     if args.debug_mode:
