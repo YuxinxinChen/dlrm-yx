@@ -210,6 +210,21 @@ class DLRM_Net(nn.Module):
 
         return emb_l
 
+    # Only supports GPU for now
+    def create_emb_batched(self, D, Es, learning_rate=0.1):
+        import table_batched_embeddings_ops
+        self.Es = Es
+        T = len(Es)
+        return table_batched_embeddings_ops.TableBatchedEmbeddingBags(
+            T,
+            Es,
+            D,
+            optimizer=table_batched_embeddings_ops.Optimizer.SGD,
+            learning_rate=learning_rate,
+            eps=0.1,
+            stochastic_rounding=False,
+        ).cuda()
+
     def __init__(
         self,
         m_spa=None,
@@ -229,6 +244,8 @@ class DLRM_Net(nn.Module):
         qr_threshold=200,
         md_flag=False,
         md_threshold=200,
+        batched_emb=False,
+        batched_emb_L_max=38,
     ):
         super(DLRM_Net, self).__init__()
 
@@ -261,9 +278,15 @@ class DLRM_Net(nn.Module):
                 self.md_threshold = md_threshold
             # create operators
             if ndevices <= 1:
-                self.emb_l = self.create_emb(m_spa, ln_emb)
+                if batched_emb:
+                    self.emb_l = self.create_emb_batched(m_spa, ln_emb)
+                else:
+                    self.emb_l = self.create_emb(m_spa, ln_emb)
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
+            # use table batched embedding
+            self.batched_emb = batched_emb
+            self.batched_emb_L_max = batched_emb_L_max
 
     def apply_mlp(self, x, layers):
         # approach 1: use ModuleList
@@ -299,11 +322,39 @@ class DLRM_Net(nn.Module):
         # print(ly)
         return ly
 
+    def apply_emb_batched(self, lS_o, lS_i):
+        import table_batched_embeddings
+
+        # lS_i: List of T tensors with size <= B * L, each of which contains concatenated indices segments with variable lengths, as L is never fixed
+        # -> indices (T * B * L)
+        # lS_o: List of T tensors with size (B), each of which contains B offsets with variable difference between each consecutive pair of them, as L is never fixed
+        # -> offsets (T * B + 1)
+
+        indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int().cuda()
+        E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
+        offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]]).cuda()], dim=0).int().cuda()
+
+        return table_batched_embeddings.forward(
+            self.emb_l.embedding_weights,
+            self.emb_l.table_offsets,
+            indices,
+            offsets,
+            None,
+            self.batched_emb_L_max,
+            1,
+            True,
+        )
+
     def interact_features(self, x, ly):
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
             (batch_size, d) = x.shape
-            T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
+            # print(x.shape)
+            # print(ly.shape)
+            if isinstance(ly, list):
+                T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
+            else:
+                T = torch.cat((x.view(batch_size, 1, d), ly), dim=1)
             # perform a dot product
             Z = torch.bmm(T, torch.transpose(T, 1, 2))
             # append dense feature with the interactions (into a row vector)
@@ -323,7 +374,10 @@ class DLRM_Net(nn.Module):
             R = torch.cat([x] + [Zflat], dim=1)
         elif self.arch_interaction_op == "cat":
             # concatenation features (into a row vector)
-            R = torch.cat([x] + ly, dim=1)
+            if isinstance(ly, list):
+                R = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
+            else:
+                R = torch.cat((x.view(batch_size, 1, d), ly), dim=1)
         else:
             sys.exit(
                 "ERROR: --arch-interaction-op="
@@ -347,7 +401,10 @@ class DLRM_Net(nn.Module):
         # print(x.detach().cpu().numpy())
 
         # process sparse features(using embeddings), resulting in a list of row vectors
-        ly = self.apply_emb(lS_o, lS_i, self.emb_l)
+        if not self.batched_emb:
+            ly = self.apply_emb(lS_o, lS_i, self.emb_l)
+        else:
+            ly = self.apply_emb_batched(lS_o, lS_i)
         # for y in ly:
         #     print(y.detach().cpu().numpy())
 
@@ -529,6 +586,7 @@ if __name__ == "__main__":
     parser.add_argument("--qr-threshold", type=int, default=200)
     parser.add_argument("--qr-operation", type=str, default="mult")
     parser.add_argument("--qr-collisions", type=int, default=4)
+    parser.add_argument("--batched-emb", action="store_true", default=False)
     # activations and loss
     parser.add_argument("--activation-function", type=str, default="relu")
     parser.add_argument("--loss-function", type=str, default="mse")  # or bce or wbce
@@ -755,25 +813,25 @@ if __name__ == "__main__":
         )
         print(ln_emb)
 
-        print("data (inputs and targets):")
-        for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
-            # early exit if nbatches was set by the user and has been exceeded
-            if nbatches > 0 and j >= nbatches:
-                break
+        # print("data (inputs and targets):")
+        # for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
+        #     # early exit if nbatches was set by the user and has been exceeded
+        #     if nbatches > 0 and j >= nbatches:
+        #         break
 
-            print("mini-batch: %d" % j)
-            print(X.detach().cpu().numpy())
-            # transform offsets to lengths when printing
-            print(
-                [
-                    np.diff(
-                        S_o.detach().cpu().tolist() + list(lS_i[i].shape)
-                    ).tolist()
-                    for i, S_o in enumerate(lS_o)
-                ]
-            )
-            print([S_i.detach().cpu().tolist() for S_i in lS_i])
-            print(T.detach().cpu().numpy())
+        #     print("mini-batch: %d" % j)
+        #     print(X.detach().cpu().numpy())
+        #     # transform offsets to lengths when printing
+        #     print(
+        #         [
+        #             np.diff(
+        #                 S_o.detach().cpu().tolist() + list(lS_i[i].shape)
+        #             ).tolist()
+        #             for i, S_o in enumerate(lS_o)
+        #         ]
+        #     )
+        #     print([S_i.detach().cpu().tolist() for S_i in lS_i])
+        #     print(T.detach().cpu().numpy())
 
     ndevices = min(ngpus, args.mini_batch_size, num_fea - 1) if use_gpu else -1
 
@@ -799,13 +857,15 @@ if __name__ == "__main__":
         qr_threshold=args.qr_threshold,
         md_flag=args.md_flag,
         md_threshold=args.md_threshold,
+        batched_emb=args.batched_emb,
+        batched_emb_L_max=args.num_indices_per_lookup,
     )
     # test prints
     if args.debug_mode:
         print("initial parameters (weights and bias):")
-        for param in dlrm.parameters():
-            print(param.detach().cpu().numpy())
-        # print(dlrm)
+        # for param in dlrm.parameters():
+        #     print(param.detach().cpu().numpy())
+        print(dlrm)
 
     if use_gpu:
         # Custom Model-Data Parallel
@@ -1258,11 +1318,11 @@ if __name__ == "__main__":
         # dot = make_dot(V, params=dict(dlrm.named_parameters()))
         # dot.render('dlrm_s_pytorch_graph') # write .pdf file
 
-    # test prints
-    if not args.inference_only and args.debug_mode:
-        print("updated parameters (weights and bias):")
-        for param in dlrm.parameters():
-            print(param.detach().cpu().numpy())
+    # # test prints
+    # if not args.inference_only and args.debug_mode:
+    #     print("updated parameters (weights and bias):")
+    #     for param in dlrm.parameters():
+    #         print(param.detach().cpu().numpy())
 
     # export the model in onnx
     if args.save_onnx:
