@@ -575,48 +575,48 @@ class RandomDataset(Dataset):
         # torch.manual_seed(numpy_rand_seed)
 
     def __getitem__(self, index):
+        with torch.autograd.profiler.record_function("module::get_batch_data"):
+            if isinstance(index, slice):
+                return [
+                    self[idx] for idx in range(
+                        index.start or 0, index.stop or len(self), index.step or 1
+                    )
+                ]
 
-        if isinstance(index, slice):
-            return [
-                self[idx] for idx in range(
-                    index.start or 0, index.stop or len(self), index.step or 1
+            # WARNING: reset seed on access to first element
+            # (e.g. if same random samples needed across epochs)
+            if self.reset_seed_on_access and index == 0:
+                self.reset_numpy_seed(self.rand_seed)
+
+            # number of data points in a batch
+            n = min(self.mini_batch_size, self.data_size - (index * self.mini_batch_size))
+
+            # generate a batch of dense and sparse features
+            if self.data_generation == "random":
+                (X, lS_o, lS_i) = generate_uniform_input_batch(
+                    self.m_den,
+                    self.ln_emb,
+                    n,
+                    self.num_indices_per_lookup,
+                    self.num_indices_per_lookup_fixed
                 )
-            ]
+            elif self.data_generation == "synthetic":
+                (X, lS_o, lS_i) = generate_synthetic_input_batch(
+                    self.m_den,
+                    self.ln_emb,
+                    n,
+                    self.num_indices_per_lookup,
+                    self.num_indices_per_lookup_fixed,
+                    self.trace_file,
+                    self.enable_padding
+                )
+            else:
+                sys.exit(
+                    "ERROR: --data-generation=" + self.data_generation + " is not supported"
+                )
 
-        # WARNING: reset seed on access to first element
-        # (e.g. if same random samples needed across epochs)
-        if self.reset_seed_on_access and index == 0:
-            self.reset_numpy_seed(self.rand_seed)
-
-        # number of data points in a batch
-        n = min(self.mini_batch_size, self.data_size - (index * self.mini_batch_size))
-
-        # generate a batch of dense and sparse features
-        if self.data_generation == "random":
-            (X, lS_o, lS_i) = generate_uniform_input_batch(
-                self.m_den,
-                self.ln_emb,
-                n,
-                self.num_indices_per_lookup,
-                self.num_indices_per_lookup_fixed
-            )
-        elif self.data_generation == "synthetic":
-            (X, lS_o, lS_i) = generate_synthetic_input_batch(
-                self.m_den,
-                self.ln_emb,
-                n,
-                self.num_indices_per_lookup,
-                self.num_indices_per_lookup_fixed,
-                self.trace_file,
-                self.enable_padding
-            )
-        else:
-            sys.exit(
-                "ERROR: --data-generation=" + self.data_generation + " is not supported"
-            )
-
-        # generate a batch of target (probability of a click)
-        T = generate_random_output_batch(n, self.num_targets, self.round_targets)
+            # generate a batch of target (probability of a click)
+            T = generate_random_output_batch(n, self.num_targets, self.round_targets)
 
         return (X, lS_o, lS_i, T)
 
