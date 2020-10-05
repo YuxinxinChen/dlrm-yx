@@ -1,1 +1,1 @@
-../sparse_ads_baselines/table_batched_embeddings_ops.py
+../sparse-ads-baselines/table_batched_embeddings_ops.py

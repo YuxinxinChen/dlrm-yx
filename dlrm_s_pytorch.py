@@ -321,17 +321,7 @@ class DLRM_Net(nn.Module):
         return ly
 
     def apply_emb_batched(self, lS_o, lS_i):
-        import table_batched_embeddings
-
-        # lS_i: List of T tensors with size <= B * L, each of which contains concatenated indices segments with variable lengths, as L is never fixed
-        # -> indices (T * B * L)
-        # lS_o: List of T tensors with size (B), each of which contains B offsets with variable difference between each consecutive pair of them, as L is never fixed
-        # -> offsets (T * B + 1)
-
-        indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int().cuda()
-        E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
-        offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]]).cuda()], dim=0).int().cuda()
-        return self.emb_l(indices, offsets)
+        return self.emb_l(lS_i.cuda(), lS_o.cuda()) # By default batched_emb only supports CUDA
 
     def interact_features(self, x, ly):
         if self.arch_interaction_op == "dot":
@@ -381,25 +371,29 @@ class DLRM_Net(nn.Module):
 
     def sequential_forward(self, dense_x, lS_o, lS_i):
         # process dense features (using bottom mlp), resulting in a row vector
-        x = self.apply_mlp(dense_x, self.bot_l)
+        with torch.autograd.profiler.record_function("module::forward_pass::bottom_mlp"):
+            x = self.apply_mlp(dense_x, self.bot_l)
         # debug prints
         # print("intermediate")
         # print(x.detach().cpu().numpy())
 
         # process sparse features(using embeddings), resulting in a list of row vectors
-        if not self.batched_emb:
-            ly = self.apply_emb(lS_o, lS_i, self.emb_l)
-        else:
-            ly = self.apply_emb_batched(lS_o, lS_i)
+        with torch.autograd.profiler.record_function("module::forward_pass::embedding_lookup"):
+            if not self.batched_emb:
+                ly = self.apply_emb(lS_o, lS_i, self.emb_l)
+            else:
+                ly = self.apply_emb_batched(lS_o, lS_i)
         # for y in ly:
         #     print(y.detach().cpu().numpy())
 
         # interact features (dense and sparse)
-        z = self.interact_features(x, ly)
+        with torch.autograd.profiler.record_function("module::forward_pass::interaction"):
+            z = self.interact_features(x, ly)
         # print(z.detach().cpu().numpy())
 
         # obtain probability of a click (using top mlp)
-        p = self.apply_mlp(z, self.top_l)
+        with torch.autograd.profiler.record_function("module::forward_pass::top_mlp"):
+            p = self.apply_mlp(z, self.top_l)
 
         # clamp output if needed
         if 0.0 < self.loss_threshold and self.loss_threshold < 1.0:

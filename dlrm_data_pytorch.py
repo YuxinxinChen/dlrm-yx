@@ -539,6 +539,7 @@ class RandomDataset(Dataset):
             mini_batch_size,
             num_indices_per_lookup,
             num_indices_per_lookup_fixed,
+            batched_emb,
             num_targets=1,
             round_targets=False,
             data_generation="random",
@@ -562,6 +563,7 @@ class RandomDataset(Dataset):
         self.mini_batch_size = mini_batch_size
         self.num_indices_per_lookup = num_indices_per_lookup
         self.num_indices_per_lookup_fixed = num_indices_per_lookup_fixed
+        self.batched_emb = batched_emb
         self.num_targets = num_targets
         self.round_targets = round_targets
         self.data_generation = data_generation
@@ -618,6 +620,17 @@ class RandomDataset(Dataset):
             # generate a batch of target (probability of a click)
             T = generate_random_output_batch(n, self.num_targets, self.round_targets)
 
+            if self.batched_emb:
+                # lS_i: List of T tensors with size <= B * L, each of which contains concatenated indices segments with variable lengths, as L is never fixed
+                # -> indices (T * B * L)
+                # lS_o: List of T tensors with size (B), each of which contains B offsets with variable difference between each consecutive pair of them, as L is never fixed
+                # -> offsets (T * B + 1)
+                indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
+                E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
+                offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]])], dim=0).int() # TODO: fix this
+                lS_i = indices
+                lS_o = offsets
+
         return (X, lS_o, lS_i, T)
 
     def __len__(self):
@@ -630,7 +643,7 @@ def collate_wrapper_random(list_of_tuples):
     # where each tuple is (X, lS_o, lS_i, T)
     (X, lS_o, lS_i, T) = list_of_tuples[0]
     return (X,
-            torch.stack(lS_o),
+            torch.stack(lS_o) if isinstance(lS_o, list) else lS_o,
             lS_i,
             T)
 
@@ -645,6 +658,7 @@ def make_random_data_and_loader(args, ln_emb, m_den):
         args.mini_batch_size,
         args.num_indices_per_lookup,
         args.num_indices_per_lookup_fixed,
+        args.batched_emb,
         1,  # num_targets
         args.round_targets,
         args.data_generation,
