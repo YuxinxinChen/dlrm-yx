@@ -1303,6 +1303,18 @@ if __name__ == "__main__":
         dot = make_dot(V, params=dict(dlrm.named_parameters()))
         dot.render('dlrm_s_pytorch_graph') # write .pdf file
 
+        # Print compute graph in networkx format
+        import networkx as nx
+        import pydot
+        from pprint import pprint
+        (pydot_graph,)= pydot.graph_from_dot_data(dot.source)
+        g = nx.Graph(nx.nx_pydot.from_pydot(pydot_graph))
+        id_to_name_map = {node_id: g._node[node_id]['label'].replace('\n', '').replace('"', '') for node_id in g.nodes}
+        nodes = [id_to_name_map[id] for id in g.nodes]
+        edges = [(id_to_name_map[id1], id_to_name_map[id2]) for id1, id2 in g.edges]
+        pprint(nodes)
+        pprint(edges)
+
     # # test prints
     # if not args.inference_only and args.debug_mode:
     #     print("updated parameters (weights and bias):")
