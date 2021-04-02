@@ -66,7 +66,7 @@ class DataLoader:
 
 
 def _transform_features(
-        x_int_batch, x_cat_batch, y_batch, max_ind_range, flag_input_torch_tensor=False
+        x_int_batch, x_cat_batch, y_batch, max_ind_range, flag_input_torch_tensor=False, batched_emb=False
 ):
     if max_ind_range > 0:
         x_cat_batch = x_cat_batch % max_ind_range
@@ -83,8 +83,16 @@ def _transform_features(
     batch_size = x_cat_batch.shape[0]
     feature_count = x_cat_batch.shape[1]
     lS_o = torch.arange(batch_size).reshape(1, -1).repeat(feature_count, 1)
+    lS_i = x_cat_batch.t()
 
-    return x_int_batch, lS_o, x_cat_batch.t(), y_batch.view(-1, 1)
+    if batched_emb:
+        indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
+        E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
+        offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]])], dim=0).int() # TODO: fix this
+        lS_i = indices
+        lS_o = offsets
+
+    return x_int_batch, lS_o, lS_i, y_batch.view(-1, 1)
 
 
 def _batch_generator(
@@ -196,7 +204,7 @@ class CriteoBinDataset(Dataset):
     """Binary version of criteo dataset."""
 
     def __init__(self, data_file, counts_file,
-                 batch_size=1, max_ind_range=-1, bytes_per_feature=4):
+                 batch_size=1, max_ind_range=-1, bytes_per_feature=4, batched_emb=False):
         # dataset
         self.tar_fea = 1   # single target
         self.den_fea = 13  # 13 dense  features
@@ -219,6 +227,9 @@ class CriteoBinDataset(Dataset):
         # hardcoded for now
         self.m_den = 13
 
+        # using table batched embedding lookup
+        self.batched_emb = batched_emb
+
     def __len__(self):
         return self.num_entries
 
@@ -232,7 +243,8 @@ class CriteoBinDataset(Dataset):
                                    x_cat_batch=tensor[:, 14:],
                                    y_batch=tensor[:, 0],
                                    max_ind_range=self.max_ind_range,
-                                   flag_input_torch_tensor=True)
+                                   flag_input_torch_tensor=True,
+                                   batched_emb=self.batched_emb)
 
 
 def numpy_to_binary(input_files, output_file_path, split='train'):
@@ -240,6 +252,7 @@ def numpy_to_binary(input_files, output_file_path, split='train'):
 
     # WARNING - both categorical and numerical data must fit into int32 for
     # the following code to work correctly
+    # OOM risk: concatenate one matrix after another and del+gc.collect to get through.
 
     with open(output_file_path, 'wb') as output_file:
         if split == 'train':

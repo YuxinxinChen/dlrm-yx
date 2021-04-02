@@ -587,7 +587,8 @@ def concatCriteoAdData(
             total_counter = [0] * days
             for i in range(days):
                 filename_i = npzfile + "_{0}_processed.npz".format(i)
-                with np.load(filename_i) as data:
+                # OOM risk.
+                with np.load(filename_i, mmap_mode='r') as data:
                     X_cat = data["X_cat"]
                     X_int = data["X_int"]
                     y = data["y"]
@@ -606,7 +607,7 @@ def concatCriteoAdData(
                 counter = [0] * days
                 days_to_sample = days if data_split == "none" else days - 1
                 if randomize == "total":
-                    rand_u = np.random.randint(low=0, high=days_to_sample, size=size)
+                    rand_u = np.random.randint(low=0, high=days_to_sample, size=size) if days_to_sample > 0 else [0] * size
                     for k in range(size):
                         # sample and make sure elements per buckets do not overflow
                         if data_split == "none" or i < days - 1:
@@ -683,9 +684,9 @@ def concatCriteoAdData(
                 filename_j_y = npzfile + "_{0}_intermediate_y.npy".format(j)
                 filename_j_d = npzfile + "_{0}_intermediate_d.npy".format(j)
                 filename_j_s = npzfile + "_{0}_intermediate_s.npy".format(j)
-                fj_y = np.load(filename_j_y)
-                fj_d = np.load(filename_j_d)
-                fj_s = np.load(filename_j_s)
+                fj_y = np.load(filename_j_y, mmap_mode='r')
+                fj_d = np.load(filename_j_d, mmap_mode='r')
+                fj_s = np.load(filename_j_s, mmap_mode='r')
 
                 indices = range(total_per_file[j])
                 if randomize == "day" or randomize == "total":

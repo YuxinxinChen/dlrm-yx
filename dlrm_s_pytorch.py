@@ -350,6 +350,7 @@ class DLRM_Net(nn.Module):
             R = torch.cat([x] + [Zflat], dim=1)
         elif self.arch_interaction_op == "cat":
             # concatenation features (into a row vector)
+            (batch_size, d) = x.shape
             if self.batched_emb:
                 R = torch.cat((x.view(batch_size, 1, d), ly), dim=1)
             else:
@@ -371,14 +372,14 @@ class DLRM_Net(nn.Module):
 
     def sequential_forward(self, dense_x, lS_o, lS_i):
         # process dense features (using bottom mlp), resulting in a row vector
-        with torch.autograd.profiler.record_function("module::forward_pass::bottom_mlp"):
+        with torch.profiler.record_function("module::forward_pass::bottom_mlp"):
             x = self.apply_mlp(dense_x, self.bot_l)
         # debug prints
         # print("intermediate")
         # print(x.detach().cpu().numpy())
 
         # process sparse features(using embeddings), resulting in a list of row vectors
-        with torch.autograd.profiler.record_function("module::forward_pass::embedding_lookup"):
+        with torch.profiler.record_function("module::forward_pass::embedding_lookup"):
             if not self.batched_emb:
                 ly = self.apply_emb(lS_o, lS_i, self.emb_l)
             else:
@@ -387,12 +388,12 @@ class DLRM_Net(nn.Module):
         #     print(y.detach().cpu().numpy())
 
         # interact features (dense and sparse)
-        with torch.autograd.profiler.record_function("module::forward_pass::interaction"):
+        with torch.profiler.record_function("module::forward_pass::interaction"):
             z = self.interact_features(x, ly)
         # print(z.detach().cpu().numpy())
 
         # obtain probability of a click (using top mlp)
-        with torch.autograd.profiler.record_function("module::forward_pass::top_mlp"):
+        with torch.profiler.record_function("module::forward_pass::top_mlp"):
             p = self.apply_mlp(z, self.top_l)
 
         # clamp output if needed
@@ -589,7 +590,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-ind-range", type=int, default=-1)
     parser.add_argument("--data-sub-sample-rate", type=float, default=0.0)  # in [0, 1]
     parser.add_argument("--num-indices-per-lookup", type=int, default=10)
-    parser.add_argument("--num-indices-per-lookup-fixed", type=bool, default=False)
+    parser.add_argument("--num-indices-per-lookup-fixed", action="store_true", default=False)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--memory-map", action="store_true", default=False)
     parser.add_argument("--dataset-multiprocessing", action="store_true", default=False,
@@ -667,7 +668,6 @@ if __name__ == "__main__":
     ln_bot = np.fromstring(args.arch_mlp_bot, dtype=int, sep="-")
     # input data
     if (args.data_generation == "dataset"):
-
         train_data, train_ld, test_data, test_ld = \
             dp.make_criteo_data_and_loaders(args)
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
@@ -682,12 +682,14 @@ if __name__ == "__main__":
             )))
         m_den = train_data.m_den
         ln_bot[0] = m_den
+        print("ln_emb: ", ln_emb)
     else:
         # input and target at random
         ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
         m_den = ln_bot[0]
         train_data, train_ld = dp.make_random_data_and_loader(args, ln_emb, m_den)
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
+        print("ln_emb: ", ln_emb)
 
     ### parse command line arguments ###
     m_spa = args.arch_sparse_feature_size
@@ -984,7 +986,8 @@ if __name__ == "__main__":
         )
 
     print("time/loss/accuracy (if enabled):")
-    with torch.autograd.profiler.profile(args.enable_profiling, use_gpu) as prof:
+    profile_activity = [torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU] if use_gpu else [torch.profiler.ProfilerActivity.CPU]
+    with torch.profiler.profile(activities=profile_activity, record_shapes=True) as prof:
         while k < args.nepochs:
             if k < skip_upto_epoch:
                 continue
@@ -994,7 +997,21 @@ if __name__ == "__main__":
             if args.mlperf_logging:
                 previous_iteration_time = None
 
-            for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
+            ld_iter = iter(train_ld)
+
+            next_batch = ld_iter.next() # start loading the first batch
+            if use_gpu:
+                next_batch = [ _.cuda(non_blocking=True) for _ in next_batch ]
+
+            for j in range(len((train_ld))):
+                X, lS_o, lS_i, T = next_batch
+
+                if j + 2 != len(train_ld):
+                    # start copying data of next batch
+                    next_batch = ld_iter.next()
+                    if use_gpu:
+                        next_batch = [ _.cuda(non_blocking=True) for _ in next_batch]
+
                 if j == 0 and args.save_onnx:
                     (X_onnx, lS_o_onnx, lS_i_onnx) = (X, lS_o, lS_i)
 
@@ -1025,11 +1042,11 @@ if __name__ == "__main__":
                 '''
 
                 # forward pass
-                with torch.autograd.profiler.record_function("module::forward_pass"):
+                with torch.profiler.record_function("module::forward_pass"):
                     Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, device)
 
                 # loss
-                with torch.autograd.profiler.record_function("module::loss"):
+                with torch.profiler.record_function("module::loss"):
                     E = loss_fn_wrap(Z, T, use_gpu, device)
                 '''
                 # debug prints
@@ -1038,7 +1055,7 @@ if __name__ == "__main__":
                 print(E.detach().cpu().numpy())
                 '''
                 # compute loss and accuracy
-                with torch.autograd.profiler.record_function("module::others"):
+                with torch.profiler.record_function("module::others"):
                     L = E.detach().cpu().numpy()  # numpy array
                     S = Z.detach().cpu().numpy()  # numpy array
                     T = T.detach().cpu().numpy()  # numpy array
@@ -1048,10 +1065,10 @@ if __name__ == "__main__":
                 if not args.inference_only:
                     # scaled error gradient propagation
                     # (where we do not accumulate gradients across mini-batches)
-                    with torch.autograd.profiler.record_function("module::zero_grad"):
+                    with torch.profiler.record_function("module::zero_grad"):
                         optimizer.zero_grad()
                     # backward pass
-                    with torch.autograd.profiler.record_function("module::backward_pass"):
+                    with torch.profiler.record_function("module::backward_pass"):
                         E.backward()
                     # debug prints (check gradient norm)
                     # for l in mlp.layers:
@@ -1079,7 +1096,7 @@ if __name__ == "__main__":
                     and (((j + 1) % args.test_freq == 0) or (j + 1 == nbatches))
                 )
 
-                with torch.autograd.profiler.record_function("module::print_and_test"):
+                with torch.profiler.record_function("module::print_and_test"):
                     # print time, loss and accuracy
                     if should_print or should_test:
                         gT = 1000.0 * total_time / total_iter if args.print_time else -1
