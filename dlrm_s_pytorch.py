@@ -321,7 +321,7 @@ class DLRM_Net(nn.Module):
         return ly
 
     def apply_emb_batched(self, lS_o, lS_i):
-        return self.emb_l(lS_i.cuda(), lS_o.cuda()) # By default batched_emb only supports CUDA
+        return self.emb_l(lS_i.cuda(non_blocking=True), lS_o.cuda(non_blocking=True)) # By default batched_emb only supports CUDA
 
     def interact_features(self, x, ly):
         if self.arch_interaction_op == "dot":
@@ -426,8 +426,8 @@ class DLRM_Net(nn.Module):
             t_list = []
             for k, emb in enumerate(self.emb_l):
                 d = torch.device("cuda:" + str(k % ndevices))
-                emb.to(d)
-                t_list.append(emb.to(d))
+                emb.to(d, non_blocking=True)
+                t_list.append(emb.to(d, non_blocking=True))
             self.emb_l = nn.ModuleList(t_list)
             self.parallel_model_is_not_prepared = False
 
@@ -443,8 +443,8 @@ class DLRM_Net(nn.Module):
         i_list = []
         for k, _ in enumerate(self.emb_l):
             d = torch.device("cuda:" + str(k % ndevices))
-            t_list.append(lS_o[k].to(d))
-            i_list.append(lS_i[k].to(d))
+            t_list.append(lS_o[k].to(d, non_blocking=True))
+            i_list.append(lS_i[k].to(d, non_blocking=True))
         lS_o = t_list
         lS_i = i_list
 
@@ -611,6 +611,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-onnx", action="store_true", default=False)
     # gpu
     parser.add_argument("--use-gpu", action="store_true", default=False)
+    parser.add_argument("--pin-memory", action="store_true", default=False)
     # debugging and profiling
     parser.add_argument("--print-freq", type=int, default=1)
     parser.add_argument("--test-freq", type=int, default=-1)
@@ -852,7 +853,7 @@ if __name__ == "__main__":
         # Custom Model-Data Parallel
         # the mlps are replicated and use data parallelism, while
         # the embeddings are distributed and use model parallelism
-        dlrm = dlrm.to(device)  # .cuda()
+        dlrm = dlrm.to(device, non_blocking=True)  # .cuda()
         if dlrm.ndevices > 1:
             dlrm.emb_l = dlrm.create_emb(m_spa, ln_emb)
 
@@ -883,12 +884,12 @@ if __name__ == "__main__":
         if use_gpu:  # .cuda()
             # lS_i can be either a list of tensors or a stacked tensor.
             # Handle each case below:
-            lS_i = [S_i.to(device) for S_i in lS_i] if isinstance(lS_i, list) \
-                else lS_i.to(device)
-            lS_o = [S_o.to(device) for S_o in lS_o] if isinstance(lS_o, list) \
-                else lS_o.to(device)
+            lS_i = [S_i.to(device, non_blocking=True) for S_i in lS_i] if isinstance(lS_i, list) \
+                else lS_i.to(device, non_blocking=True)
+            lS_o = [S_o.to(device, non_blocking=True) for S_o in lS_o] if isinstance(lS_o, list) \
+                else lS_o.to(device, non_blocking=True)
             return dlrm(
-                X.to(device),
+                X.to(device, non_blocking=True),
                 lS_o,
                 lS_i
             )
@@ -898,16 +899,16 @@ if __name__ == "__main__":
     def loss_fn_wrap(Z, T, use_gpu, device):
         if args.loss_function == "mse" or args.loss_function == "bce":
             if use_gpu:
-                return loss_fn(Z, T.to(device))
+                return loss_fn(Z, T.to(device, non_blocking=True))
             else:
                 return loss_fn(Z, T)
         elif args.loss_function == "wbce":
             if use_gpu:
                 loss_ws_ = loss_ws[T.data.view(-1).long()].view_as(T).to(device)
-                loss_fn_ = loss_fn(Z, T.to(device))
+                loss_fn_ = loss_fn(Z, T.to(device, non_blocking=True))
             else:
                 loss_ws_ = loss_ws[T.data.view(-1).long()].view_as(T)
-                loss_fn_ = loss_fn(Z, T.to(device))
+                loss_fn_ = loss_fn(Z, T.to(device, non_blocking=True))
             loss_sc_ = loss_ws_ * loss_fn_
             # debug prints
             # print(loss_ws_)
@@ -997,20 +998,22 @@ if __name__ == "__main__":
             if args.mlperf_logging:
                 previous_iteration_time = None
 
-            ld_iter = iter(train_ld)
+            # ld_iter = iter(train_ld)
 
-            next_batch = ld_iter.next() # start loading the first batch
-            if use_gpu:
-                next_batch = [ _.cuda(non_blocking=True) for _ in next_batch ]
+            # next_batch = ld_iter.next() # start loading the first batch
+            # if use_gpu:
+            #     next_batch = [ _.cuda(non_blocking=True) for _ in next_batch ]
 
-            for j in range(len((train_ld))):
-                X, lS_o, lS_i, T = next_batch
+            # for j in range(len((train_ld))):
+            #     X, lS_o, lS_i, T = next_batch
 
-                if j + 2 != len(train_ld):
-                    # start copying data of next batch
-                    next_batch = ld_iter.next()
-                    if use_gpu:
-                        next_batch = [ _.cuda(non_blocking=True) for _ in next_batch]
+            #     if j + 2 != len(train_ld):
+            #         # start copying data of next batch
+            #         next_batch = ld_iter.next()
+            #         if use_gpu:
+            #             next_batch = [ _.cuda(non_blocking=True) for _ in next_batch]
+
+            for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
 
                 if j == 0 and args.save_onnx:
                     (X_onnx, lS_o_onnx, lS_i_onnx) = (X, lS_o, lS_i)
