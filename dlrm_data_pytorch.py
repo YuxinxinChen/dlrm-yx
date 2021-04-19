@@ -669,13 +669,6 @@ class RandomDataset(Dataset):
                         lS_i = torch.stack(lS_indices[b])
                         y = lT[b].view(-1, 1)
 
-                        if self.batched_emb:
-                            indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
-                            E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
-                            offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]])], dim=0).int() # TODO: fix this
-                            lS_i = indices
-                            lS_o = offsets
-
                         with h5py.File(fname, 'w') as hf:
                             _ = hf.create_dataset('X', data=X, shape=X.shape)
                             _ = hf.create_dataset('lS_o', data=lS_o, shape=lS_o.shape)
@@ -728,6 +721,13 @@ class RandomDataset(Dataset):
                         lS_o = torch.tensor(np.array(hf['lS_o']))
                         lS_i = torch.tensor(np.array(hf['lS_i']))
                         y = torch.tensor(np.array(hf['y']))
+
+                    if self.batched_emb:
+                        indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
+                        E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
+                        offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]])], dim=0).int() # TODO: fix this
+                        lS_i = indices
+                        lS_o = offsets
 
                     return X, lS_o, lS_i, y
             else:

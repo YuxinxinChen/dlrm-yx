@@ -245,6 +245,8 @@ class DLRM_Net(nn.Module):
         md_flag=False,
         md_threshold=200,
         batched_emb=False,
+        L_max=100,
+        BT_block_size=32,
     ):
         super(DLRM_Net, self).__init__()
 
@@ -285,6 +287,8 @@ class DLRM_Net(nn.Module):
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
             # use table batched embedding
             self.batched_emb = batched_emb
+            self.L_max = L_max
+            self.BT_block_size = BT_block_size
 
     def apply_mlp(self, x, layers):
         # approach 1: use ModuleList
@@ -321,7 +325,18 @@ class DLRM_Net(nn.Module):
         return ly
 
     def apply_emb_batched(self, lS_o, lS_i):
-        return self.emb_l(lS_i.cuda(non_blocking=True), lS_o.cuda(non_blocking=True)) # By default batched_emb only supports CUDA
+        # By default batched_emb only supports CUDA
+        import table_batched_embeddings
+        return table_batched_embeddings.forward(
+            self.emb_l.embedding_weights,
+            self.emb_l.table_offsets,
+            lS_i.cuda(non_blocking=True),
+            lS_o.cuda(non_blocking=True),
+            None,
+            self.L_max,
+            self.BT_block_size,
+            True,
+        )
 
     def interact_features(self, x, ly):
         if self.arch_interaction_op == "dot":
@@ -574,7 +589,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--loss-weights", type=dash_separated_floats, default="1.0-1.0")  # for wbce
     parser.add_argument("--loss-threshold", type=float, default=0.0)  # 1.0e-7
-    parser.add_argument("--round-targets", type=bool, default=False)
+    parser.add_argument("--round-targets", action="store_true", default=False)
     # data
     parser.add_argument("--data-size", type=int, default=1)
     parser.add_argument("--num-batches", type=int, default=0)
@@ -591,6 +606,7 @@ if __name__ == "__main__":
     parser.add_argument("--data-sub-sample-rate", type=float, default=0.0)  # in [0, 1]
     parser.add_argument("--num-indices-per-lookup", type=int, default=10)
     parser.add_argument("--num-indices-per-lookup-fixed", action="store_true", default=False)
+    parser.add_argument("--BT-block-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--memory-map", action="store_true", default=False)
     parser.add_argument("--dataset-multiprocessing", action="store_true", default=False,
@@ -841,6 +857,8 @@ if __name__ == "__main__":
         md_flag=args.md_flag,
         md_threshold=args.md_threshold,
         batched_emb=args.batched_emb,
+        L_max=args.num_indices_per_lookup,
+        BT_block_size=args.BT_block_size
     )
     # test prints
     if args.debug_mode:
