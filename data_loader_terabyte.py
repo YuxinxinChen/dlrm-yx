@@ -183,10 +183,12 @@ def _batch_generator(
 def _test():
     generator = _batch_generator(
         data_filename='day',
-        data_directory='/input',
+        data_directory='./input',
         days=range(23),
         split="train",
-        batch_size=2048
+        batch_size=2048,
+        drop_last=True,
+        max_ind_range=-1
     )
     t1 = time.time()
     for x_int, lS_o, x_cat, y in generator:
@@ -245,6 +247,9 @@ class CriteoBinDataset(Dataset):
                                    max_ind_range=self.max_ind_range,
                                    flag_input_torch_tensor=True,
                                    batched_emb=self.batched_emb)
+
+    def __del__(self):
+        self.file.close()
 
 
 def numpy_to_binary(input_files, output_file_path, split='train'):
@@ -315,7 +320,7 @@ def _test_bin():
                         required=True)
     args = parser.parse_args()
 
-    # _preprocess(args)
+    _preprocess(args)
 
     binary_data_file = os.path.join(args.output_directory,
                                     '{}_data.bin'.format(args.split))
@@ -324,7 +329,8 @@ def _test_bin():
     dataset_binary = CriteoBinDataset(data_file=binary_data_file,
                                             counts_file=counts_file,
                                             batch_size=2048,)
-    from dlrm_data_pytorch import CriteoDataset, collate_wrapper_criteo
+    from dlrm_data_pytorch import CriteoDataset
+    from dlrm_data_pytorch import collate_wrapper_criteo_offset as collate_wrapper_criteo
 
     binary_loader = torch.utils.data.DataLoader(
         dataset_binary,
@@ -372,4 +378,4 @@ def _test_bin():
 
 if __name__ == '__main__':
     _test()
-    _test_bin
+    _test_bin()

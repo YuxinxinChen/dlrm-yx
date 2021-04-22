@@ -884,7 +884,7 @@ def getCriteoAdData(
         randomize='total',
         criteo_kaggle=True,
         memory_map=False,
-        dataset_multiprocessing=False
+        dataset_multiprocessing=False,
 ):
     # Passes through entire dataset and defines dictionaries for categorical
     # features and determines the number of total categories.
@@ -1176,11 +1176,12 @@ def getCriteoAdData(
                                  convertDicts,
                                  counts,
                                  )
-                           ) for i in range (0, days)]
+                           ) for i in range(0, days)]
         for process in processes:
             process.start()
         for process in processes:
             process.join()
+
     else:
         for i in range(days):
             processCriteoAdData(d_path, d_file, npzfile, i, convertDicts, counts)
@@ -1226,7 +1227,7 @@ def loadDataset(
     lstr = raw_path.split("/")
     d_path = "/".join(lstr[0:-1]) + "/"
     d_file = lstr[-1].split(".")[0] if dataset == "kaggle" else lstr[-1]
-    npzfile = d_path + ((d_file + "_day") if dataset == "kaggle" else d_file)
+    npzfile = (d_file + "_day") if dataset == "kaggle" else d_file
     # trafile = d_path + ((d_file + "_fea") if dataset == "kaggle" else "fea")
 
     # check if pre-processed data is available
