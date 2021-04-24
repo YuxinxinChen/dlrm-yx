@@ -469,7 +469,7 @@ def make_criteo_data_and_loaders(args, offset_to_length_converter=False):
                 shuffle=False,
                 num_workers=0,
                 collate_fn=None,
-                pin_memory=False,
+                pin_memory=args.pin_memory,
                 drop_last=False,
                 sampler=RandomSampler(train_data) if args.mlperf_bin_shuffle else None
             )
@@ -492,7 +492,7 @@ def make_criteo_data_and_loaders(args, offset_to_length_converter=False):
                 shuffle=False,
                 num_workers=0,
                 collate_fn=None,
-                pin_memory=False,
+                pin_memory=args.pin_memory,
                 drop_last=False,
             )
         else:
@@ -574,7 +574,7 @@ def make_criteo_data_and_loaders(args, offset_to_length_converter=False):
             shuffle=False,
             num_workers=args.num_workers,
             collate_fn=collate_wrapper_criteo,
-            pin_memory=False,
+            pin_memory=args.pin_memory,
             drop_last=False,  # True
         )
 
@@ -584,7 +584,7 @@ def make_criteo_data_and_loaders(args, offset_to_length_converter=False):
             shuffle=False,
             num_workers=args.test_num_workers,
             collate_fn=collate_wrapper_criteo,
-            pin_memory=False,
+            pin_memory=args.pin_memory,
             drop_last=False,  # True
         )
 
