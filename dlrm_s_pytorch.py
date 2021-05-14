@@ -998,7 +998,7 @@ def run():
     parser.add_argument("--raw-data-file", type=str, default="")
     parser.add_argument("--processed-data-file", type=str, default="")
     parser.add_argument("--data-randomize", type=str, default="total")  # or day or none
-    parser.add_argument("--data-trace-enable-padding", type=bool, default=False)
+    parser.add_argument("--data-trace-enable-padding", action="store_true", default=False)
     parser.add_argument("--max-ind-range", type=int, default=-1)
     parser.add_argument("--data-sub-sample-rate", type=float, default=0.0)  # in [0, 1]
     parser.add_argument("--num-indices-per-lookup", type=int, default=10)
@@ -1011,7 +1011,7 @@ def run():
     parser.add_argument("--learning-rate", type=float, default=0.01)
     parser.add_argument("--print-precision", type=int, default=5)
     parser.add_argument("--numpy-rand-seed", type=int, default=123)
-    parser.add_argument("--sync-dense-params", type=bool, default=True)
+    parser.add_argument("--sync-dense-params", action="store_true", default=True)
     parser.add_argument("--optimizer", type=str, default="sgd")
     parser.add_argument(
         "--dataset-multiprocessing",
