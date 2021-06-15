@@ -695,17 +695,24 @@ class DLRM_Net(nn.Module):
             self.top_l_replicas = replicate(self.top_l, device_ids)
             self.parallel_model_batch_size = batch_size
 
-        def get_device_indices_for_tables(T, Es, ndevices):
-            buckets = [0] * ndevices
-            table_device_indices = [0] * T # Mapping of embedding tables to devices
-            for k, E in enumerate(Es):
-                device_idx = buckets.index(min(buckets))
-                buckets[device_idx] += E
-                table_device_indices[k] = device_idx # Which table goes to which device
-            return table_device_indices
+        def get_device_indices_for_tables(T, Es, ndevices, balance_type="simple"):
+            if balance_type == "simple": # Simple greedy load balancing
+                buckets = [0] * ndevices
+                table_device_indices = [0] * T # Mapping of embedding tables to devices
+                for k, E in enumerate(Es):
+                    device_idx = buckets.index(min(buckets))
+                    buckets[device_idx] += E
+                    table_device_indices[k] = device_idx # Which table goes to which device
+                return table_device_indices
+            elif balance_type == "naive":
+                return [(x % ndevices) for x in Es]
+            raise Exception("Unknown load balancing type!")
 
         if self.parallel_model_is_not_prepared:
-            self.device_indices = get_device_indices_for_tables(T, self.ln_emb, ndevices)
+            """
+                N.B.: Tables can be sorted but doesn't necessarily come in in order.
+            """
+            self.device_indices = get_device_indices_for_tables(T, sorted(self.ln_emb), ndevices)
             # distribute embeddings (model parallelism)
             t_list = []
             w_list = []
@@ -714,10 +721,10 @@ class DLRM_Net(nn.Module):
                 for _ in range(ndevices):
                     tmp_t_list.append([])
                 for k in range(T):
-                    tmp_t_list[self.device_indices[k]].append(self.ln_emb[k])
+                    tmp_t_list[self.device_indices[k]].append(sorted(self.ln_emb)[k])
                 for k, t in enumerate(tmp_t_list):
                     d = torch.device("cuda:" + str(k))
-                    emb, _ = self.create_emb_batched(self.m_spa, t, args.weighted_pooling) # Create batched embdding for tables distributed to each device
+                    emb, _ = self.create_emb_batched(self.m_spa, t, self.weighted_pooling) # Create batched embdding for tables distributed to each device
                     t_list.append(emb.to(d, non_blocking=True))
                 self.emb_l = nn.ModuleList(t_list) # Has length of # devices
                 # TODO: Fix v_W_l
@@ -746,25 +753,35 @@ class DLRM_Net(nn.Module):
         t_list = []
         i_list = []
         if self.batched_emb:
+            """
+                N.B.: We only consider reordering data for batched emb for now.
+            """
             tmp_o = []
             tmp_i = []
             for _ in range(ndevices):
                 tmp_o.append([])
                 tmp_i.append([])
-            L = int(lS_i.shape[0] / B / T) # Assuming L is fixed.
+            L = int(lS_i.shape[0] / B / T) # Assuming L is fixed
+            tmp_list = []
             for k in range(T):
                 o = lS_o[(k * B):((k+1) * B + 1)] # e.g. first table takes 0 to 2048 (inclusive), second takes 2048 to 4096 (inclusive)...
+                tmp_list.append((self.ln_emb[k], o - o[0], lS_i[(k * B * L):((k+1) * B * L)])) # Append WITHIN-PER-TABLE offsets and indices to a list (TABLES NOT SORTED BY LENGTH YET)
+            tmp_list = sorted(tmp_list, key=lambda x: x[0]) # Sort by ln_emb
+            for k, tmp in enumerate(tmp_list):
+                o = tmp[1]
+                i = tmp[2]
                 if not tmp_o[self.device_indices[k]]:
-                    tmp_o[self.device_indices[k]].append(o - o[0])
+                    tmp_o[self.device_indices[k]].append(o)
                 else:
-                    tmp_o[self.device_indices[k]].append(o[1:] - o[0] + tmp_o[self.device_indices[k]][-1][-1]) # Shift the global offsets to device local offsets
-                tmp_i[self.device_indices[k]].append(lS_i[(k * B * L):((k+1) * B * L)])
+                    tmp_o[self.device_indices[k]].append(o[1:] + tmp_o[self.device_indices[k]][-1][-1]) # Shift the global offsets to device local offsets
+                tmp_i[self.device_indices[k]].append(i)
+                
             for k in range(ndevices):
                 d = torch.device("cuda:" + str(self.device_indices[k]))
                 t_list.append(torch.cat(tmp_o[k], dim=0).to(d, non_blocking=True))
                 i_list.append(torch.cat(tmp_i[k], dim=0).to(d, non_blocking=True))
         else:
-            for k, _ in enumerate(self.emb_l):
+            for k in range(T):
                 d = torch.device("cuda:" + str(self.device_indices[k]))
                 t_list.append(lS_o[k].to(d, non_blocking=True))
                 i_list.append(lS_i[k].to(d, non_blocking=True))
@@ -813,7 +830,7 @@ class DLRM_Net(nn.Module):
         #   list (non-batched) or tensor (batched) of partial output across the batch dimension of table 0, table 1, table 2... # device 1
         # ]
         if self.batched_emb:
-            ly = list(map(lambda y: torch.cat(y, dim=1), zip(*t_list))) # e.g., [1024, 4, 64] & [1024, 4, 64] = [1024, 8, 64] per device, tables OUT OF ORDER
+            ly = list(map(lambda y: torch.cat(y, dim=1), zip(*t_list))) # e.g., [1024, 4, 64] & [1024, 4, 64] = [1024, 8, 64] per device, tables OUT OF ORDER, e.g. [[0, 2, 3], [1, 4, 5]]
             device_table_list = [] # Which device processed which tables
             for _ in range(ndevices):
                 device_table_list.append([])
