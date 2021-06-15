@@ -492,20 +492,6 @@ class DLRM_Net(nn.Module):
     def apply_emb_batched(self, lS_o, lS_i):
         ly = []
         for E, offset, indices in zip(self.emb_l, lS_o, lS_i):
-            # print(E.embedding_weights.shape, E.embedding_weights.get_device())
-            # print(E)
-            # print(offset.shape, indices.shape)
-            # print(offset)
-            # print(indices)
-            # from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo
-            # nvmlInit()
-            # h = nvmlDeviceGetHandleByIndex(0)
-            # info = nvmlDeviceGetMemoryInfo(h)
-            # print(f'total    : {info.total}')
-            # print(f'free     : {info.free}')
-            # print(f'used     : {info.used}')
-            # import GPUtil
-            # GPUtil.showUtilization()
             ly.append(E(indices, offset))
         return ly # Length of # devices
 
@@ -652,10 +638,10 @@ class DLRM_Net(nn.Module):
 
         # process sparse features(using embeddings), resulting in a list of row vectors
         with torch.profiler.record_function("module::forward_pass::embedding_lookup"):
-            if not self.batched_emb:
-                ly = self.apply_emb([lS_o], [lS_i]) # New apply_emb API accepts lists as inputs
+            if self.batched_emb:
+                ly = self.apply_emb_batched([lS_o], [lS_i]) # New apply_emb API accepts lists as inputs
             else:
-                ly = self.apply_emb_batched(lS_o, lS_i)
+                ly = self.apply_emb(lS_o, lS_i)
         # for y in ly:
         #     print(y.detach().cpu().numpy())
 
@@ -1668,6 +1654,10 @@ def run():
                     def __exit__(self, exc_type, exc_value, traceback):
                         return False
 
+                if use_gpu:
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+
                 for j, inputBatch in enumerate(train_ld):
                     with record_function("## BENCHMARK ##") if args.collect_execution_graph else dummy_record_function():
                         if j == 0 and args.save_onnx:
@@ -1687,6 +1677,8 @@ def run():
                             previous_iteration_time = current_time
                         else:
                             t1 = time_wrap(use_gpu)
+                        if use_gpu:
+                            start_event.record()
 
                         # early exit if nbatches was set by the user and has been exceeded
                         if nbatches > 0 and j >= nbatches:
@@ -1746,11 +1738,16 @@ def run():
                                 optimizer.step()
                                 lr_scheduler.step()
 
-                        if args.mlperf_logging:
-                            total_time += iteration_time
+                        if use_gpu:
+                            end_event.record()
+                            torch.cuda.synchronize()
+                            total_time += start_event.elapsed_time(end_event) * 1.e-3
                         else:
-                            t2 = time_wrap(use_gpu)
-                            total_time += t2 - t1
+                            if args.mlperf_logging:
+                                total_time += iteration_time
+                            else:
+                                t2 = time_wrap(use_gpu)
+                                total_time += t2 - t1
 
                         total_loss += L * mbs
                         total_iter += 1
