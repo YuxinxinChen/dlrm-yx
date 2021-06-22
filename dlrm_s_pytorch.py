@@ -424,7 +424,7 @@ class DLRM_Net(nn.Module):
                 """
                     N.B.: Tables can be sorted but doesn't necessarily come in in order.
                 """
-                T = len(self.ln_emb) if self.batched_emb else len(self.emb_l)
+                T = len(self.ln_emb)
                 self.device_indices = get_device_indices_for_tables(T, sorted(self.ln_emb), ndevices)
 
             # quantization
@@ -929,7 +929,7 @@ def inference(
             testBatch
         )
         with record_function("DLRM distribute emb data"):
-            if ndevices > 1:
+            if ndevices > 1 and dlrm.batched_emb:
                 lS_o_test, lS_i_test = dlrm.distribute_emb_data(X_test.size()[0], lS_o_test, lS_i_test)
 
         # Skip the batch if batch size not multiple of total ranks
@@ -1689,7 +1689,7 @@ def run():
 
                         X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
                         with record_function("DLRM distribute emb data"):
-                            if ndevices > 1:
+                            if ndevices > 1 and dlrm.batched_emb:
                                 lS_o, lS_i = dlrm.distribute_emb_data(X.size()[0], lS_o, lS_i)
 
                         if args.mlperf_logging:
