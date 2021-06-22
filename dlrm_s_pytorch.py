@@ -402,8 +402,30 @@ class DLRM_Net(nn.Module):
                     self.v_W_l = w_list
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
+
             # use table batched embedding
             self.batched_emb = batched_emb
+
+            # if multi-GPU
+            if ndevices > 1:
+                # get device indices for tables
+                def get_device_indices_for_tables(T, Es, ndevices, balance_type="simple"):
+                    if balance_type == "simple": # Simple greedy load balancing
+                        buckets = [0] * ndevices
+                        table_device_indices = [0] * T # Mapping of embedding tables to devices
+                        for k, E in enumerate(Es):
+                            device_idx = buckets.index(min(buckets))
+                            buckets[device_idx] += E
+                            table_device_indices[k] = device_idx # Which table goes to which device
+                        return table_device_indices
+                    elif balance_type == "naive":
+                        return [(x % ndevices) for x in Es]
+                    raise Exception("Unknown load balancing type!")
+                """
+                    N.B.: Tables can be sorted but doesn't necessarily come in in order.
+                """
+                T = len(self.ln_emb) if self.batched_emb else len(self.emb_l)
+                self.device_indices = get_device_indices_for_tables(T, sorted(self.ln_emb), ndevices)
 
             # quantization
             self.quantize_emb = False
@@ -662,6 +684,42 @@ class DLRM_Net(nn.Module):
 
         return z
 
+    def distribute_emb_data(self, batch_size, lS_o, lS_i):
+        """
+            N.B.: We only consider reordering data for BATCHED embedding lookup for now.
+        """
+        B = batch_size
+        T = len(self.ln_emb) if self.batched_emb else len(self.emb_l)
+        ndevices = min(self.ndevices, batch_size, T)
+        t_list = []
+        i_list = []
+
+        tmp_o = []
+        tmp_i = []
+        for _ in range(ndevices):
+            tmp_o.append([])
+            tmp_i.append([])
+        L = int(lS_i.shape[0] / B / T) # Assuming L is fixed
+        tmp_list = []
+        for k in range(T):
+            o = lS_o[(k * B):((k+1) * B + 1)] # e.g. first table takes 0 to 2048 (inclusive), second takes 2048 to 4096 (inclusive)...
+            tmp_list.append((self.ln_emb[k], o - o[0], lS_i[(k * B * L):((k+1) * B * L)])) # Append WITHIN-PER-TABLE offsets and indices to a list (TABLES NOT SORTED BY LENGTH YET)
+        tmp_list = sorted(tmp_list, key=lambda x: x[0]) # Sort by ln_emb
+        for k, tmp in enumerate(tmp_list):
+            o = tmp[1]
+            i = tmp[2]
+            if not tmp_o[self.device_indices[k]]:
+                tmp_o[self.device_indices[k]].append(o)
+            else:
+                tmp_o[self.device_indices[k]].append(o[1:] + tmp_o[self.device_indices[k]][-1][-1]) # Shift the global offsets to device local offsets
+            tmp_i[self.device_indices[k]].append(i)
+
+        for k in range(ndevices):
+            t_list.append(torch.cat(tmp_o[k], dim=0))
+            i_list.append(torch.cat(tmp_i[k], dim=0))
+
+        return t_list, i_list
+
     def parallel_forward(self, dense_x, lS_o, lS_i):
         ### prepare model (overwrite) ###
         # WARNING: # of devices must be >= batch size in parallel_forward call
@@ -681,24 +739,7 @@ class DLRM_Net(nn.Module):
             self.top_l_replicas = replicate(self.top_l, device_ids)
             self.parallel_model_batch_size = batch_size
 
-        def get_device_indices_for_tables(T, Es, ndevices, balance_type="simple"):
-            if balance_type == "simple": # Simple greedy load balancing
-                buckets = [0] * ndevices
-                table_device_indices = [0] * T # Mapping of embedding tables to devices
-                for k, E in enumerate(Es):
-                    device_idx = buckets.index(min(buckets))
-                    buckets[device_idx] += E
-                    table_device_indices[k] = device_idx # Which table goes to which device
-                return table_device_indices
-            elif balance_type == "naive":
-                return [(x % ndevices) for x in Es]
-            raise Exception("Unknown load balancing type!")
-
         if self.parallel_model_is_not_prepared:
-            """
-                N.B.: Tables can be sorted but doesn't necessarily come in in order.
-            """
-            self.device_indices = get_device_indices_for_tables(T, sorted(self.ln_emb), ndevices)
             # distribute embeddings (model parallelism)
             t_list = []
             w_list = []
@@ -739,33 +780,10 @@ class DLRM_Net(nn.Module):
         t_list = []
         i_list = []
         if self.batched_emb:
-            """
-                N.B.: We only consider reordering data for batched emb for now.
-            """
-            tmp_o = []
-            tmp_i = []
-            for _ in range(ndevices):
-                tmp_o.append([])
-                tmp_i.append([])
-            L = int(lS_i.shape[0] / B / T) # Assuming L is fixed
-            tmp_list = []
-            for k in range(T):
-                o = lS_o[(k * B):((k+1) * B + 1)] # e.g. first table takes 0 to 2048 (inclusive), second takes 2048 to 4096 (inclusive)...
-                tmp_list.append((self.ln_emb[k], o - o[0], lS_i[(k * B * L):((k+1) * B * L)])) # Append WITHIN-PER-TABLE offsets and indices to a list (TABLES NOT SORTED BY LENGTH YET)
-            tmp_list = sorted(tmp_list, key=lambda x: x[0]) # Sort by ln_emb
-            for k, tmp in enumerate(tmp_list):
-                o = tmp[1]
-                i = tmp[2]
-                if not tmp_o[self.device_indices[k]]:
-                    tmp_o[self.device_indices[k]].append(o)
-                else:
-                    tmp_o[self.device_indices[k]].append(o[1:] + tmp_o[self.device_indices[k]][-1][-1]) # Shift the global offsets to device local offsets
-                tmp_i[self.device_indices[k]].append(i)
-                
             for k in range(ndevices):
                 d = torch.device("cuda:" + str(self.device_indices[k]))
-                t_list.append(torch.cat(tmp_o[k], dim=0).to(d, non_blocking=True))
-                i_list.append(torch.cat(tmp_i[k], dim=0).to(d, non_blocking=True))
+                t_list.append(lS_o[k].to(d, non_blocking=True))
+                i_list.append(lS_i[k].to(d, non_blocking=True))
         else:
             for k in range(T):
                 d = torch.device("cuda:" + str(self.device_indices[k]))
@@ -910,6 +928,9 @@ def inference(
         X_test, lS_o_test, lS_i_test, T_test, W_test, CBPP_test = unpack_batch(
             testBatch
         )
+        with record_function("DLRM distribute emb data"):
+            if ndevices > 1:
+                lS_o_test, lS_i_test = dlrm.distribute_emb_data(X_test.size()[0], lS_o_test, lS_i_test)
 
         # Skip the batch if batch size not multiple of total ranks
         if ext_dist.my_size > 1 and X_test.size(0) % ext_dist.my_size != 0:
@@ -1667,6 +1688,9 @@ def run():
                             continue
 
                         X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
+                        with record_function("DLRM distribute emb data"):
+                            if ndevices > 1:
+                                lS_o, lS_i = dlrm.distribute_emb_data(X.size()[0], lS_o, lS_i)
 
                         if args.mlperf_logging:
                             current_time = time_wrap(use_gpu)
