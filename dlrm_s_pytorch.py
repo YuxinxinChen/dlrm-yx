@@ -1516,6 +1516,8 @@ def run():
     total_loss = 0
     total_iter = 0
     total_samp = 0
+    warmup_iter = 5
+    all_time = 0
 
     if args.mlperf_logging:
         mlperf_logger.mlperf_submission_log("dlrm")
@@ -1763,6 +1765,7 @@ def run():
                                 lr_scheduler.step()
 
                         if use_gpu:
+                            torch.cuda.synchronize()
                             end_event.record()
                             torch.cuda.synchronize()
                             total_time += start_event.elapsed_time(end_event) * 1.e-3
@@ -1789,6 +1792,7 @@ def run():
                         # print time, loss and accuracy
                         if should_print or should_test:
                             gT = 1000.0 * total_time / total_iter if args.print_time else -1
+                            all_time += 1000.0 * total_time if j > warmup_iter else 0
                             total_time = 0
 
                             train_loss = total_loss / total_samp
@@ -1905,6 +1909,8 @@ def run():
                                         },
                                     )
                                 break
+
+                print("Overall per-batch training time: {:.2f} ms".format((all_time / (args.num_batches - warmup_iter)) if args.num_batches > warmup_iter else 0))
 
                 if args.mlperf_logging:
                     mlperf_logger.barrier()
