@@ -511,10 +511,14 @@ class DLRM_Net(nn.Module):
         # print(ly)
         return ly
 
-    def apply_emb_batched(self, lS_o, lS_i):
-        ly = []
-        for E, offset, indices in zip(self.emb_l, lS_o, lS_i):
-            ly.append(E(indices, offset))
+    def apply_emb_batched(self, lS_o, lS_i, device_ids=None):
+        if device_ids is not None:
+            inputs = [(indices, offset) for offset, indices in zip(lS_o, lS_i)]
+            ly = parallel_apply(self.emb_l, inputs, None, device_ids)
+        else:
+            ly = []
+            for E, offset, indices in zip(self.emb_l, lS_o, lS_i):
+                ly.append(E(indices, offset))
         return ly # Length of # devices
 
     #  using quantizing functions from caffe2/aten/src/ATen/native/quantized/cpu
@@ -589,27 +593,28 @@ class DLRM_Net(nn.Module):
             return self.parallel_forward(dense_x, lS_o, lS_i)
 
     def distributed_forward(self, dense_x, lS_o, lS_i):
-        batch_size = dense_x.size()[0]
-        # WARNING: # of ranks must be <= batch size in distributed_forward call
-        if batch_size < ext_dist.my_size:
-            sys.exit(
-                "ERROR: batch_size (%d) must be larger than number of ranks (%d)"
-                % (batch_size, ext_dist.my_size)
-            )
-        if batch_size % ext_dist.my_size != 0:
-            sys.exit(
-                "ERROR: batch_size %d can not split across %d ranks evenly"
-                % (batch_size, ext_dist.my_size)
-            )
+        with torch.profiler.record_function("module::forward_pass::prologue"):
+            batch_size = dense_x.size()[0]
+            # WARNING: # of ranks must be <= batch size in distributed_forward call
+            if batch_size < ext_dist.my_size:
+                sys.exit(
+                    "ERROR: batch_size (%d) must be larger than number of ranks (%d)"
+                    % (batch_size, ext_dist.my_size)
+                )
+            if batch_size % ext_dist.my_size != 0:
+                sys.exit(
+                    "ERROR: batch_size %d can not split across %d ranks evenly"
+                    % (batch_size, ext_dist.my_size)
+                )
 
-        dense_x = dense_x[ext_dist.get_my_slice(batch_size)]
-        lS_o = lS_o[self.local_emb_slice]
-        lS_i = lS_i[self.local_emb_slice]
+            dense_x = dense_x[ext_dist.get_my_slice(batch_size)]
+            lS_o = lS_o[self.local_emb_slice]
+            lS_i = lS_i[self.local_emb_slice]
 
-        if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
-            sys.exit(
-                "ERROR: corrupted model input detected in distributed_forward call"
-            )
+            if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
+                sys.exit(
+                    "ERROR: corrupted model input detected in distributed_forward call"
+                )
 
         # embeddings
         with record_function("DLRM embedding forward"):
@@ -722,79 +727,80 @@ class DLRM_Net(nn.Module):
 
     def parallel_forward(self, dense_x, lS_o, lS_i):
         ### prepare model (overwrite) ###
-        # WARNING: # of devices must be >= batch size in parallel_forward call
-        batch_size = dense_x.size()[0]
-        B = batch_size
-        T = len(self.ln_emb) if self.batched_emb else len(self.emb_l)
-        ndevices = min(self.ndevices, batch_size, T)
-        device_ids = range(ndevices)
-        # WARNING: must redistribute the model if mini-batch size changes(this is common
-        # for last mini-batch, when # of elements in the dataset/batch size is not even
-        if self.parallel_model_batch_size != batch_size:
-            self.parallel_model_is_not_prepared = True
+        with torch.profiler.record_function("module::forward_pass::prologue"):
+            # WARNING: # of devices must be >= batch size in parallel_forward call
+            batch_size = dense_x.size()[0]
+            B = batch_size
+            T = len(self.ln_emb) if self.batched_emb else len(self.emb_l)
+            ndevices = min(self.ndevices, batch_size, T)
+            device_ids = range(ndevices)
+            # WARNING: must redistribute the model if mini-batch size changes(this is common
+            # for last mini-batch, when # of elements in the dataset/batch size is not even
+            if self.parallel_model_batch_size != batch_size:
+                self.parallel_model_is_not_prepared = True
 
-        if self.parallel_model_is_not_prepared or self.sync_dense_params:
-            # replicate mlp (data parallelism)
-            self.bot_l_replicas = replicate(self.bot_l, device_ids)
-            self.top_l_replicas = replicate(self.top_l, device_ids)
-            self.parallel_model_batch_size = batch_size
+            if self.parallel_model_is_not_prepared or self.sync_dense_params:
+                # replicate mlp (data parallelism)
+                self.bot_l_replicas = replicate(self.bot_l, device_ids)
+                self.top_l_replicas = replicate(self.top_l, device_ids)
+                self.parallel_model_batch_size = batch_size
 
-        if self.parallel_model_is_not_prepared:
-            # distribute embeddings (model parallelism)
-            t_list = []
-            w_list = []
-            if self.batched_emb:
-                tmp_t_list = []
-                for _ in range(ndevices):
-                    tmp_t_list.append([])
-                for k in range(T):
-                    tmp_t_list[self.device_indices[k]].append(sorted(self.ln_emb)[k])
-                for k, t in enumerate(tmp_t_list):
-                    d = torch.device("cuda:" + str(k))
-                    emb, _ = self.create_emb_batched(self.m_spa, t, self.weighted_pooling) # Create batched embdding for tables distributed to each device
-                    t_list.append(emb.to(d, non_blocking=True))
-                self.emb_l = nn.ModuleList(t_list) # Has length of # devices
-                # TODO: Fix v_W_l
-            else:
-                for k, emb in enumerate(self.emb_l):
-                    d = torch.device("cuda:" + str(self.device_indices[k]))
-                    t_list.append(emb.to(d))
-                    if self.weighted_pooling == "learned":
-                        w_list.append(Parameter(self.v_W_l[k].to(d)))
-                    elif self.weighted_pooling == "fixed":
-                        w_list.append(self.v_W_l[k].to(d))
-                    else:
-                        w_list.append(None)
-                self.emb_l = nn.ModuleList(t_list)
-                if self.weighted_pooling == "learned":
-                    self.v_W_l = nn.ParameterList(w_list)
+            if self.parallel_model_is_not_prepared:
+                # distribute embeddings (model parallelism)
+                t_list = []
+                w_list = []
+                if self.batched_emb:
+                    tmp_t_list = []
+                    for _ in range(ndevices):
+                        tmp_t_list.append([])
+                    for k in range(T):
+                        tmp_t_list[self.device_indices[k]].append(sorted(self.ln_emb)[k])
+                    for k, t in enumerate(tmp_t_list):
+                        d = torch.device("cuda:" + str(k))
+                        emb, _ = self.create_emb_batched(self.m_spa, t, self.weighted_pooling) # Create batched embdding for tables distributed to each device
+                        t_list.append(emb.to(d, non_blocking=True))
+                    self.emb_l = nn.ModuleList(t_list) # Has length of # devices
+                    # TODO: Fix v_W_l
                 else:
-                    self.v_W_l = w_list
-            self.parallel_model_is_not_prepared = False
+                    for k, emb in enumerate(self.emb_l):
+                        d = torch.device("cuda:" + str(self.device_indices[k]))
+                        t_list.append(emb.to(d))
+                        if self.weighted_pooling == "learned":
+                            w_list.append(Parameter(self.v_W_l[k].to(d)))
+                        elif self.weighted_pooling == "fixed":
+                            w_list.append(self.v_W_l[k].to(d))
+                        else:
+                            w_list.append(None)
+                    self.emb_l = nn.ModuleList(t_list)
+                    if self.weighted_pooling == "learned":
+                        self.v_W_l = nn.ParameterList(w_list)
+                    else:
+                        self.v_W_l = w_list
+                self.parallel_model_is_not_prepared = False
 
-        ### prepare input (overwrite) ###
-        # scatter dense features (data parallelism)
-        # print(dense_x.device)
-        dense_x = scatter(dense_x, device_ids, dim=0)
-        # distribute sparse features (model parallelism)
-        t_list = []
-        i_list = []
-        if self.batched_emb:
-            for k in range(ndevices):
-                d = torch.device("cuda:" + str(self.device_indices[k]))
-                t_list.append(lS_o[k].to(d, non_blocking=True))
-                i_list.append(lS_i[k].to(d, non_blocking=True))
-        else:
-            for k in range(T):
-                d = torch.device("cuda:" + str(self.device_indices[k]))
-                t_list.append(lS_o[k].to(d, non_blocking=True))
-                i_list.append(lS_i[k].to(d, non_blocking=True))
-        lS_o = t_list
-        lS_i = i_list # batched_emb: lS_o and lS_i are lists with the length of # devices
-        # distribute sparse features (model parallelism)
-        # --- Check it here for both batched and non-batched as all the variables won't be further modified. ---
-        if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
-            sys.exit("ERROR: corrupted model input detected in parallel_forward call")
+            ### prepare input (overwrite) ###
+            # scatter dense features (data parallelism)
+            # print(dense_x.device)
+            dense_x = scatter(dense_x, device_ids, dim=0)
+            # distribute sparse features (model parallelism)
+            t_list = []
+            i_list = []
+            if self.batched_emb:
+                for k in range(ndevices):
+                    d = torch.device("cuda:" + str(self.device_indices[k]))
+                    t_list.append(lS_o[k].to(d, non_blocking=True))
+                    i_list.append(lS_i[k].to(d, non_blocking=True))
+            else:
+                for k in range(T):
+                    d = torch.device("cuda:" + str(self.device_indices[k]))
+                    t_list.append(lS_o[k].to(d, non_blocking=True))
+                    i_list.append(lS_i[k].to(d, non_blocking=True))
+            lS_o = t_list
+            lS_i = i_list # batched_emb: lS_o and lS_i are lists with the length of # devices
+            # distribute sparse features (model parallelism)
+            # --- Check it here for both batched and non-batched as all the variables won't be further modified. ---
+            if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
+                sys.exit("ERROR: corrupted model input detected in parallel_forward call")
 
         ### compute results in parallel ###
         # bottom mlp
@@ -803,57 +809,59 @@ class DLRM_Net(nn.Module):
         # inputs that has been scattered across devices on the first (batch) dimension.
         # The output is a list of tensors scattered across devices according to the
         # distribution of dense_x.
-        x = parallel_apply(self.bot_l_replicas, dense_x, None, device_ids)
-        # debug prints
-        # print(x)
+        with torch.profiler.record_function("module::forward_pass::bottom_mlp"):
+            x = parallel_apply(self.bot_l_replicas, dense_x, None, device_ids)
+            # debug prints
+            # print(x)
 
         # embeddings
-        if self.batched_emb:
-            ly = self.apply_emb_batched(lS_o, lS_i) # In parallel_forward lS_o and lS_i are already lists
-        else:
-            ly = self.apply_emb(lS_o, lS_i)
-        # debug prints
-        # print(ly)
+        with torch.profiler.record_function("module::forward_pass::embedding_lookup"):
+            if self.batched_emb:
+                ly = self.apply_emb_batched(lS_o, lS_i, device_ids=device_ids) # In parallel_forward lS_o and lS_i are already lists
+            else:
+                ly = self.apply_emb(lS_o, lS_i)
+            # debug prints
+            # print(ly)
 
-        # butterfly shuffle (implemented inefficiently for now)
-        # WARNING: Note that at this point we have the result of the embedding lookup
-        # for the entire batch on each device. We would like to obtain partial results
-        # corresponding to all embedding lookups, but part of the batch on each device.
-        # Therefore, matching the distribution of output of bottom mlp, so that both
-        # could be used for subsequent interactions on each device.
-        if len(self.emb_l) != len(ly):
-            sys.exit("ERROR: corrupted intermediate result in parallel_forward call")
+            # butterfly shuffle (implemented inefficiently for now)
+            # WARNING: Note that at this point we have the result of the embedding lookup
+            # for the entire batch on each device. We would like to obtain partial results
+            # corresponding to all embedding lookups, but part of the batch on each device.
+            # Therefore, matching the distribution of output of bottom mlp, so that both
+            # could be used for subsequent interactions on each device.
+            if len(self.emb_l) != len(ly):
+                sys.exit("ERROR: corrupted intermediate result in parallel_forward call")
 
-        t_list = [] # The 0th was processed on device 0, 1st on device 1, etc...
-        for k, _ in enumerate(self.emb_l): # Modulelist of partial tables on each device
-            y = scatter(ly[k], device_ids, dim=0) # Approximately equal chunks across the batch dimension
-            t_list.append(y)
-        # adjust the list to be ordered per device
-        # [
-        #   list (non-batched) or tensor (batched) of partial output across the batch dimension of table 0, table 1, table 2... # device 0
-        #   list (non-batched) or tensor (batched) of partial output across the batch dimension of table 0, table 1, table 2... # device 1
-        # ]
-        if self.batched_emb:
-            ly = list(map(lambda y: torch.cat(y, dim=1), zip(*t_list))) # e.g., [1024, 4, 64] & [1024, 4, 64] = [1024, 8, 64] per device, tables OUT OF ORDER, e.g. [[0, 2, 3], [1, 4, 5]]
-            device_table_list = [] # Which device processed which tables
-            for _ in range(ndevices):
-                device_table_list.append([])
-            for k in range(T):
-                device_table_list[self.device_indices[k]].append(k)
-            perm = [a for b in device_table_list for a in b]
-            ly = [yy[:, perm, :] for yy in ly] # Fix the order of embedding tables
-        else:
-            ly = list(map(lambda y: list(y), zip(*t_list)))
-        # debug prints
-        # print(ly)
+            # TODO: Parallelize this part
+            t_list = [] # The 0th was processed on device 0, 1st on device 1, etc...
+            for k, _ in enumerate(self.emb_l): # Modulelist of partial tables on each device
+                y = scatter(ly[k], device_ids, dim=0) # Approximately equal chunks across the batch dimension
+                t_list.append(y)
+            # adjust the list to be ordered per device
+            # [
+            #   list (non-batched) or tensor (batched) of partial output across the batch dimension of table 0, table 1, table 2... # device 0
+            #   list (non-batched) or tensor (batched) of partial output across the batch dimension of table 0, table 1, table 2... # device 1
+            # ]
+            if self.batched_emb:
+                ly = list(map(lambda y: torch.cat(y, dim=1), zip(*t_list))) # e.g., [1024, 4, 64] & [1024, 4, 64] = [1024, 8, 64] per device, tables OUT OF ORDER, e.g. [[0, 2, 3], [1, 4, 5]]
+                device_table_list = [] # Which device processed which tables
+                for _ in range(ndevices):
+                    device_table_list.append([])
+                for k in range(T):
+                    device_table_list[self.device_indices[k]].append(k)
+                perm = [a for b in device_table_list for a in b]
+                ly = [yy[:, perm, :] for yy in ly] # Fix the order of embedding tables
+            else:
+                ly = list(map(lambda y: list(y), zip(*t_list)))
+            # debug prints
+            # print(ly)
 
         # interactions
-        z = []
-        for k in range(ndevices):
-            zk = self.interact_features(x[k], [ly[k]] if self.batched_emb else ly[k]) # To adapt
-            z.append(zk)
-        # debug prints
-        # print(z)
+        with torch.profiler.record_function("module::forward_pass::interaction"):
+            inputs = [(xx, [yy] if self.batched_emb else yy) for xx, yy in zip(x, ly)]
+            z = parallel_apply([self.interact_features] * ndevices, inputs, None, device_ids)
+            # debug prints
+            # print(z)
 
         # top mlp
         # WARNING: Note that the self.top_l is a list of top mlp modules that
@@ -861,7 +869,8 @@ class DLRM_Net(nn.Module):
         # that by construction are scattered across devices on the first (batch) dim.
         # The output is a list of tensors scattered across devices according to the
         # distribution of z.
-        p = parallel_apply(self.top_l_replicas, z, None, device_ids)
+        with torch.profiler.record_function("module::forward_pass::top_mlp"):
+            p = parallel_apply(self.top_l_replicas, z, None, device_ids)
 
         ### gather the distributed results ###
         p0 = gather(p, self.output_d, dim=0)
