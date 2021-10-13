@@ -612,34 +612,34 @@ class DLRM_Net(nn.Module):
                     )
 
         # embeddings
-        with record_function("DLRM embedding forward"):
+        with record_function("module::forward_pass::embedding_lookup"):
             if self.batched_emb:
                 ly = self.apply_emb_batched(lS_o, lS_i)
             else:
                 ly = self.apply_emb(lS_o, lS_i)
 
-        # WARNING: Note that at this point we have the result of the embedding lookup
-        # for the entire batch on each rank. We would like to obtain partial results
-        # corresponding to all embedding lookups, but part of the batch on each rank.
-        # Therefore, matching the distribution of output of bottom mlp, so that both
-        # could be used for subsequent interactions on each device.
-        if len(self.emb_l) != len(ly):
-            sys.exit("ERROR: corrupted intermediate result in distributed_forward call")
+            # WARNING: Note that at this point we have the result of the embedding lookup
+            # for the entire batch on each rank. We would like to obtain partial results
+            # corresponding to all embedding lookups, but part of the batch on each rank.
+            # Therefore, matching the distribution of output of bottom mlp, so that both
+            # could be used for subsequent interactions on each device.
+            if len(self.emb_l) != len(ly):
+                sys.exit("ERROR: corrupted intermediate result in distributed_forward call")
 
-        a2a_req = ext_dist.alltoall(ly, self.n_emb_per_rank, self.batched_emb)
+            a2a_req = ext_dist.alltoall(ly, self.n_emb_per_rank, self.batched_emb)
 
-        with record_function("DLRM bottom nlp forward"):
+        with record_function("module::forward_pass::bottom_mlp"):
             x = self.apply_mlp(dense_x, self.bot_l)
 
-        ly = a2a_req.wait()
-        ly = list(ly)
+            ly = a2a_req.wait()
+            ly = list(ly)
 
         # interactions
-        with record_function("DLRM interaction forward"):
+        with record_function("module::forward_pass::interaction"):
             z = self.interact_features(x, ly)
 
         # top mlp
-        with record_function("DLRM top nlp forward"):
+        with record_function("module::forward_pass::top_mlp"):
             p = self.apply_mlp(z, self.top_l)
 
         # clamp output if needed
