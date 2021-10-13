@@ -45,6 +45,10 @@ def get_my_slice(n):
     )
 
 
+# E.g.
+# n = 4, my_size = 2: k = 2, m = 0, splits = None, my_len = 2
+# n = 5, my_size = 3: k = 1, m = 2, splits = [2, 2, 1]
+# n = 13, my_size = 4: k = 3, m = 1, splits = [4, 3, 3, 3]
 def get_split_lengths(n):
     k, m = divmod(n, my_size)
     if m == 0:
@@ -54,6 +58,23 @@ def get_split_lengths(n):
         splits = [(k + 1) if i < m else k for i in range(my_size)]
         my_len = splits[my_rank]
     return (my_len, splits)
+
+
+# get device indices for tables
+# e.g 8 tables, No. [1,3,5,6] on device 0, No. [2,4,7,8] on device 1, then
+# return [0, 1, 0, 1, 0, 0, 1, 1]
+def get_device_indices_for_tables(T, Es, ndevices, balance_type="simple"):
+    if balance_type == "simple": # Simple greedy load balancing
+        buckets = [0] * ndevices
+        table_device_indices = [0] * T # Mapping of embedding tables to devices
+        for k, E in enumerate(Es):
+            device_idx = buckets.index(min(buckets))
+            buckets[device_idx] += E
+            table_device_indices[k] = device_idx # Which table goes to which device
+        return table_device_indices
+    elif balance_type == "naive":
+        return [(x % ndevices) for x in Es]
+    raise Exception("Unknown load balancing type!")
 
 
 def init_distributed(rank=-1, local_rank=-1, size=-1, use_gpu=False, backend=""):
@@ -427,9 +448,12 @@ class All2All_Req(Function):
             myreq.req.wait()
             myreq.req = None
             grad_input = myreq.tensor
-            grad_inputs = grad_input.view([a2a_info.batch_size, -1]).split(
-                a2a_info.emb_dim, dim=1
-            )
+            if a2a_info.batched_emb:
+                grad_inputs = [grad_input.view([a2a_info.batch_size, -1, a2a_info.emb_dim])]
+            else:
+                grad_inputs = grad_input.view([a2a_info.batch_size, -1]).split(
+                    a2a_info.emb_dim, dim=1
+                )
             grad_inputs = [gin.contiguous() for gin in grad_inputs]
             myreq.tensor = None
             return (None, *grad_inputs)
@@ -532,23 +556,63 @@ class All2AllInfo(object):
     pass
 
 
-def alltoall(inputs, per_rank_table_splits):
+# def alltoall(inputs, per_rank_table_splits):
+#     global myreq
+#     batch_size, emb_dim = inputs[0].size()
+#     a2a_info = All2AllInfo()
+#     a2a_info.local_table_num = len(inputs)
+#     a2a_info.global_table_wise_parition_slices = per_rank_table_splits
+#     (
+#         a2a_info.local_batch_num,
+#         a2a_info.global_batch_partition_slices,
+#     ) = get_split_lengths(batch_size)
+#     a2a_info.emb_dim = emb_dim
+#     a2a_info.batch_size = batch_size
+#     a2a_info.global_table_num = (
+#         sum(per_rank_table_splits)
+#         if per_rank_table_splits
+#         else a2a_info.local_table_num * my_size
+#     )
+
+#     if a2a_impl == "" and alltoall_supported or a2a_impl == "alltoall":
+#         # print("Using All2All_Req")
+#         output = All2All_Req.apply(a2a_info, *inputs)
+#         myreq.WaitFunction = All2All_Wait
+#     elif a2a_impl == "" or a2a_impl == "scatter":
+#         # print("Using All2All_Scatter_Req")
+#         output = All2All_Scatter_Req.apply(a2a_info, *inputs)
+#         myreq.WaitFunction = All2All_Scatter_Wait
+#     elif a2a_impl == "scatter_list":
+#         # print("Using All2All_ScatterList_Req")
+#         output = All2All_ScatterList_Req.apply(a2a_info, *inputs)
+#         myreq.WaitFunction = All2All_ScatterList_Wait
+#     else:
+#         print(
+#             "Unknown value set for DLRM_ALLTOALL_IMPL (%s), "
+#             "please use one of [alltoall, scatter, scatter_list]" % a2a_impl
+#         )
+#     return myreq
+
+
+def alltoall(inputs, per_rank_table_splits, batched_emb=False):
     global myreq
-    batch_size, emb_dim = inputs[0].size()
     a2a_info = All2AllInfo()
-    a2a_info.local_table_num = len(inputs)
+    if batched_emb:
+        a2a_info.batch_size, a2a_info.local_table_num, a2a_info.emb_dim = inputs[0].size()
+    else:
+        a2a_info.batch_size, a2a_info.emb_dim = inputs[0].size()
+        a2a_info.local_table_num = len(inputs)
     a2a_info.global_table_wise_parition_slices = per_rank_table_splits
     (
         a2a_info.local_batch_num,
         a2a_info.global_batch_partition_slices,
-    ) = get_split_lengths(batch_size)
-    a2a_info.emb_dim = emb_dim
-    a2a_info.batch_size = batch_size
+    ) = get_split_lengths(a2a_info.batch_size)
     a2a_info.global_table_num = (
         sum(per_rank_table_splits)
         if per_rank_table_splits
         else a2a_info.local_table_num * my_size
     )
+    a2a_info.batched_emb = batched_emb
 
     if a2a_impl == "" and alltoall_supported or a2a_impl == "alltoall":
         # print("Using All2All_Req")

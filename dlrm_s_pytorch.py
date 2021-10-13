@@ -298,11 +298,11 @@ class DLRM_Net(nn.Module):
     def create_emb_batched(self, D, Es, weighted_pooling=None, learning_rate=0.1):
         assert weighted_pooling is None, "Weighted pooling not supported yet!" # TODO: Fix this.
         import table_batched_embeddings_ops
-        self.Es = Es
-        T = len(Es)
+        self.Es = Es[self.local_emb_indices] if ext_dist.my_size > 1 else Es
+        T = len(self.Es)
         return table_batched_embeddings_ops.TableBatchedEmbeddingBags(
             T,
-            Es,
+            self.Es,
             D,
             optimizer=table_batched_embeddings_ops.Optimizer.SGD,
             learning_rate=learning_rate,
@@ -373,6 +373,9 @@ class DLRM_Net(nn.Module):
             if self.md_flag:
                 self.md_threshold = md_threshold
 
+            # use table batched embedding
+            self.batched_emb = batched_emb
+
             # If running distributed, get local slice of embedding tables
             if ext_dist.my_size > 1:
                 n_emb = len(ln_emb)
@@ -388,7 +391,13 @@ class DLRM_Net(nn.Module):
                 self.local_emb_slice = ext_dist.get_my_slice(n_emb)
                 self.local_emb_indices = list(range(n_emb))[self.local_emb_slice]
 
-            # create operators
+            # Create operators
+            # Custom Model-Data Parallel
+            # the mlps are replicated and use data parallelism, while
+            # the embeddings are distributed and use model parallelism
+            self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
+            self.top_l = self.create_mlp(ln_top, sigmoid_top)
+
             if ndevices <= 1:
                 if batched_emb:
                     self.emb_l, w_list = self.create_emb_batched(m_spa, ln_emb, weighted_pooling=weighted_pooling)
@@ -400,32 +409,12 @@ class DLRM_Net(nn.Module):
                         self.v_W_l.append(Parameter(w))
                 else:
                     self.v_W_l = w_list
-            self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
-            self.top_l = self.create_mlp(ln_top, sigmoid_top)
-
-            # use table batched embedding
-            self.batched_emb = batched_emb
-
-            # if multi-GPU
-            if ndevices > 1:
-                # get device indices for tables
-                def get_device_indices_for_tables(T, Es, ndevices, balance_type="simple"):
-                    if balance_type == "simple": # Simple greedy load balancing
-                        buckets = [0] * ndevices
-                        table_device_indices = [0] * T # Mapping of embedding tables to devices
-                        for k, E in enumerate(Es):
-                            device_idx = buckets.index(min(buckets))
-                            buckets[device_idx] += E
-                            table_device_indices[k] = device_idx # Which table goes to which device
-                        return table_device_indices
-                    elif balance_type == "naive":
-                        return [(x % ndevices) for x in Es]
-                    raise Exception("Unknown load balancing type!")
+            else: # Multi GPU. TODO: Extend to multi-node multi-GPU.
                 """
-                    N.B.: Tables can be sorted but doesn't necessarily come in in order.
+                    N.B.: Tables can be sorted but don't necessarily come in order.
                 """
                 T = len(self.ln_emb)
-                self.device_indices = get_device_indices_for_tables(T, sorted(self.ln_emb), ndevices)
+                self.device_indices = ext_dist.get_device_indices_for_tables(T, sorted(self.ln_emb), ndevices)
 
             # quantization
             self.quantize_emb = False
@@ -519,7 +508,7 @@ class DLRM_Net(nn.Module):
             ly = []
             for E, offset, indices in zip(self.emb_l, lS_o, lS_i):
                 ly.append(E(indices, offset))
-        return ly # Length of # devices
+        return ly
 
     #  using quantizing functions from caffe2/aten/src/ATen/native/quantized/cpu
     def quantize_embedding(self, bits):
@@ -541,9 +530,12 @@ class DLRM_Net(nn.Module):
         self.quantize_bits = bits
 
     def interact_features(self, x, ly):
+        (batch_size, d) = x.shape
+        if self.batched_emb: # 2D [B, T*D] -> 3D [B, T, D] after All2All
+            D = self.emb_l[0].D
+            ly = [l.view(batch_size, -1, D) for l in ly]
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
-            (batch_size, d) = x.shape
             if self.batched_emb:
                 T = torch.cat([x.view(batch_size, 1, d)] + ly, dim=1) # ly is a list of output tensors on various devices from embedding lookup
             else:
@@ -567,7 +559,6 @@ class DLRM_Net(nn.Module):
             R = torch.cat([x] + [Zflat], dim=1)
         elif self.arch_interaction_op == "cat":
             # concatenation features (into a row vector)
-            (batch_size, d) = x.shape
             if self.batched_emb:
                 R = torch.cat((x.view(batch_size, 1, d), ly), dim=1)
             else:
@@ -593,6 +584,9 @@ class DLRM_Net(nn.Module):
             return self.parallel_forward(dense_x, lS_o, lS_i)
 
     def distributed_forward(self, dense_x, lS_o, lS_i):
+        if not isinstance(self.emb_l, nn.ModuleList):
+            self.emb_l = nn.ModuleList([self.emb_l])
+
         with torch.profiler.record_function("module::forward_pass::prologue"):
             batch_size = dense_x.size()[0]
             # WARNING: # of ranks must be <= batch size in distributed_forward call
@@ -608,17 +602,21 @@ class DLRM_Net(nn.Module):
                 )
 
             dense_x = dense_x[ext_dist.get_my_slice(batch_size)]
-            lS_o = lS_o[self.local_emb_slice]
-            lS_i = lS_i[self.local_emb_slice]
+            if not self.batched_emb:
+                lS_o = lS_o[self.local_emb_slice]
+                lS_i = lS_i[self.local_emb_slice]
 
-            if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
-                sys.exit(
-                    "ERROR: corrupted model input detected in distributed_forward call"
-                )
+                if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
+                    sys.exit(
+                        "ERROR: corrupted model input detected in distributed_forward call"
+                    )
 
         # embeddings
         with record_function("DLRM embedding forward"):
-            ly = self.apply_emb(lS_o, lS_i, self.emb_l, self.v_W_l)
+            if self.batched_emb:
+                ly = self.apply_emb_batched(lS_o, lS_i)
+            else:
+                ly = self.apply_emb(lS_o, lS_i)
 
         # WARNING: Note that at this point we have the result of the embedding lookup
         # for the entire batch on each rank. We would like to obtain partial results
@@ -628,7 +626,7 @@ class DLRM_Net(nn.Module):
         if len(self.emb_l) != len(ly):
             sys.exit("ERROR: corrupted intermediate result in distributed_forward call")
 
-        a2a_req = ext_dist.alltoall(ly, self.n_emb_per_rank)
+        a2a_req = ext_dist.alltoall(ly, self.n_emb_per_rank, self.batched_emb)
 
         with record_function("DLRM bottom nlp forward"):
             x = self.apply_mlp(dense_x, self.bot_l)
@@ -689,39 +687,57 @@ class DLRM_Net(nn.Module):
 
         return z
 
-    def distribute_emb_data(self, batch_size, lS_o, lS_i):
+    def distribute_batched_emb_data(self, batch_size, lS_o, lS_i):
         """
             N.B.: We only consider reordering data for BATCHED embedding lookup for now.
         """
         B = batch_size
         T = len(self.ln_emb) if self.batched_emb else len(self.emb_l)
+        L = int(lS_i.shape[0] / B / T) # Assuming L is fixed
         ndevices = min(self.ndevices, batch_size, T)
         t_list = []
         i_list = []
 
-        tmp_o = []
-        tmp_i = []
-        for _ in range(ndevices):
-            tmp_o.append([])
-            tmp_i.append([])
-        L = int(lS_i.shape[0] / B / T) # Assuming L is fixed
+        # Split table offsets
         tmp_list = []
         for k in range(T):
             o = lS_o[(k * B):((k+1) * B + 1)] # e.g. first table takes 0 to 2048 (inclusive), second takes 2048 to 4096 (inclusive)...
             tmp_list.append((self.ln_emb[k], o - o[0], lS_i[(k * B * L):((k+1) * B * L)])) # Append WITHIN-PER-TABLE offsets and indices to a list (TABLES NOT SORTED BY LENGTH YET)
-        tmp_list = sorted(tmp_list, key=lambda x: x[0]) # Sort by ln_emb
-        for k, tmp in enumerate(tmp_list):
-            o = tmp[1]
-            i = tmp[2]
-            if not tmp_o[self.device_indices[k]]:
-                tmp_o[self.device_indices[k]].append(o)
-            else:
-                tmp_o[self.device_indices[k]].append(o[1:] + tmp_o[self.device_indices[k]][-1][-1]) # Shift the global offsets to device local offsets
-            tmp_i[self.device_indices[k]].append(i)
+        
+        tmp_o = []
+        tmp_i = []
+        # TODO: Fix for multi-node multi-GPU
+        if ext_dist.my_size > 1: # Distributed training
+            for _, tmp in enumerate(tmp_list[self.local_emb_slice]):
+                o = tmp[1]
+                i = tmp[2]
+                if not tmp_o:
+                    tmp_o.append(o)
+                else:
+                    tmp_o.append(o[1:] + tmp_o[-1][-1])
+                tmp_i.append(i)
+            t_list = [torch.cat(tmp_o, dim=0)] # Both length of 1 lists
+            i_list = [torch.cat(tmp_i, dim=0)]
+        else: # Single-node multi-GPU
+            # Assign to offsets/indices lists
+            # N lists of offsets/indices for N devices, each list contains offsets/indices to be put on that device
+            tmp_list = sorted(tmp_list, key=lambda x: x[0]) # Sort by length of tables
+            for _ in range(ndevices):
+                tmp_o.append([])
+                tmp_i.append([])
+            for k, tmp in enumerate(tmp_list):
+                o = tmp[1]
+                i = tmp[2]
+                if not tmp_o[self.device_indices[k]]:
+                    tmp_o[self.device_indices[k]].append(o)
+                else:
+                    tmp_o[self.device_indices[k]].append(o[1:] + tmp_o[self.device_indices[k]][-1][-1]) # Shift the global offsets to device local offsets
+                tmp_i[self.device_indices[k]].append(i)
 
-        for k in range(ndevices):
-            t_list.append(torch.cat(tmp_o[k], dim=0))
-            i_list.append(torch.cat(tmp_i[k], dim=0))
+            # For each device, concatenate offsets/indices into big tensors
+            for k in range(ndevices):
+                t_list.append(torch.cat(tmp_o[k], dim=0))
+                i_list.append(torch.cat(tmp_i[k], dim=0))
 
         return t_list, i_list
 
@@ -938,8 +954,9 @@ def inference(
             testBatch
         )
         with record_function("DLRM distribute emb data"):
-            if ndevices > 1 and dlrm.batched_emb:
-                lS_o_test, lS_i_test = dlrm.distribute_emb_data(X_test.size()[0], lS_o_test, lS_i_test)
+            if dlrm.batched_emb:
+                if ndevices > 1 or ext_dist.my_size > 1:
+                    lS_o_test, lS_i_test = dlrm.distribute_batched_emb_data(X_test.size()[0], lS_o_test, lS_i_test)
 
         # Skip the batch if batch size not multiple of total ranks
         if ext_dist.my_size > 1 and X_test.size(0) % ext_dist.my_size != 0:
@@ -1147,7 +1164,7 @@ def run():
     parser.add_argument("--use-gpu", action="store_true", default=False)
     parser.add_argument("--pin-memory", action="store_true", default=False)
     # distributed
-    parser.add_argument("--local_rank", type=int, default=-1)
+    parser.add_argument("--local-rank", type=int, default=-1)
     parser.add_argument("--dist-backend", type=str, default="")
     # debugging and profiling
     parser.add_argument("--print-freq", type=int, default=1)
@@ -1415,6 +1432,9 @@ def run():
     global ndevices
     ndevices = min(ngpus, args.mini_batch_size, num_fea - 1) if use_gpu else -1
 
+    # Only support GPU training for batched_emb
+    assert not (args.batched_emb and not args.use_gpu)
+
     ### construct the neural network specified above ###
     # WARNING: to obtain exactly the same initialization for
     # the weights we need to start from the same random seed.
@@ -1451,19 +1471,10 @@ def run():
         print(dlrm)
 
     if use_gpu:
-        # Custom Model-Data Parallel
-        # the mlps are replicated and use data parallelism, while
-        # the embeddings are distributed and use model parallelism
         dlrm = dlrm.to(device, non_blocking=True)  # .cuda()
-        if dlrm.ndevices > 1:
-            if not args.batched_emb: # Only create embedding tables when it's not batched, since batched embedding tables are distributed directly to GPUs.
-                dlrm.emb_l, dlrm.v_W_l = dlrm.create_emb(
-                    m_spa, ln_emb, args.weighted_pooling
-                )
-        else:
-            if dlrm.weighted_pooling == "fixed":
-                for k, w in enumerate(dlrm.v_W_l):
-                    dlrm.v_W_l[k] = w.cuda()
+        if dlrm.weighted_pooling == "fixed":
+            for k, w in enumerate(dlrm.v_W_l):
+                dlrm.v_W_l[k] = w.cuda()
 
     # distribute data parallel mlps
     if ext_dist.my_size > 1:
@@ -1490,7 +1501,7 @@ def run():
             if ext_dist.my_size == 1
             else [
                 {
-                    "params": [p for emb in dlrm.emb_l for p in emb.parameters()],
+                    "params": [p for p in dlrm.emb_l.parameters()] if args.batched_emb else [p for emb in dlrm.emb_l for p in emb.parameters()],
                     "lr": args.learning_rate,
                 },
                 # TODO check this lr setup
@@ -1700,8 +1711,9 @@ def run():
 
                         X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
                         with record_function("DLRM distribute emb data"):
-                            if ndevices > 1 and dlrm.batched_emb:
-                                lS_o, lS_i = dlrm.distribute_emb_data(X.size()[0], lS_o, lS_i)
+                            if dlrm.batched_emb:
+                                if ndevices > 1 or ext_dist.my_size > 1:
+                                    lS_o, lS_i = dlrm.distribute_batched_emb_data(X.size()[0], lS_o, lS_i)
 
                         if args.mlperf_logging:
                             current_time = time_wrap(use_gpu)
@@ -1962,9 +1974,14 @@ def run():
         #             sort_by="self_cpu_time_total"
         #         )
         #     )
-        with open("dlrm_s_pytorch.prof", "w") as prof_f:
-            prof_f.write(prof.key_averages().table(sort_by="self_cpu_time_total"))
-        prof.export_chrome_trace("dlrm_s_pytorch.json")
+        if ext_dist.my_size > 1: # Multiple trace files for distributed training
+            with open("dlrm_s_pytorch_{}.prof".format(ext_dist.my_local_rank), "w") as prof_f:
+                prof_f.write(prof.key_averages().table(sort_by="self_cpu_time_total"))
+            prof.export_chrome_trace("dlrm_s_pytorch_{}.json".format(ext_dist.my_local_rank))
+        else:
+            with open("dlrm_s_pytorch.prof", "w") as prof_f:
+                prof_f.write(prof.key_averages().table(sort_by="self_cpu_time_total"))
+            prof.export_chrome_trace("dlrm_s_pytorch.json")
         # print(prof.key_averages().table(sort_by="cpu_time_total"))
 
     # plot compute graph
