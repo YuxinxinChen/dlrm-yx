@@ -23,6 +23,9 @@ from os import path
 import sys
 import bisect
 import collections
+import h5py
+
+from numpy.core.numeric import indices
 
 import data_utils
 
@@ -342,29 +345,43 @@ def collate_wrapper_criteo_offset(list_of_tuples):
 
 
 def ensure_dataset_preprocessed(args, d_path):
-    _ = CriteoDataset(
-        args.data_set,
-        args.max_ind_range,
-        args.data_sub_sample_rate,
-        args.data_randomize,
-        "train",
-        args.raw_data_file,
-        args.processed_data_file,
-        args.memory_map,
-        args.dataset_multiprocessing
-    )
+    need_dataset = True
+    # if args.batched_emb:
+    #     tmp_d_path = '_'.join(d_path.split('_')[:-1])
+    #     train_file_no_batch = tmp_d_path + "_train.bin"
+    #     test_file_no_batch = tmp_d_path + "_test.bin"
+    #     # val_file_no_batch = tmp_d_path + "_val.bin"
+    #     counts_file_no_batch = args.raw_data_file + '_fea_count.npz'
+    #     if all(path.exists(p) for p in [train_file_no_batch,
+    #                                     test_file_no_batch,
+    #                                     counts_file_no_batch]):
+    #         print("no need dataset")
+    #         need_dataset = False # No need to get the datasets if all non-batched binary files exist
+    
+    if need_dataset:
+        _ = CriteoDataset(
+            args.data_set,
+            args.max_ind_range,
+            args.data_sub_sample_rate,
+            args.data_randomize,
+            "train",
+            args.raw_data_file,
+            args.processed_data_file,
+            args.memory_map,
+            args.dataset_multiprocessing
+        )
 
-    _ = CriteoDataset(
-        args.data_set,
-        args.max_ind_range,
-        args.data_sub_sample_rate,
-        args.data_randomize,
-        "test",
-        args.raw_data_file,
-        args.processed_data_file,
-        args.memory_map,
-        args.dataset_multiprocessing
-    )
+        _ = CriteoDataset(
+            args.data_set,
+            args.max_ind_range,
+            args.data_sub_sample_rate,
+            args.data_randomize,
+            "test",
+            args.raw_data_file,
+            args.processed_data_file,
+            args.memory_map,
+            args.dataset_multiprocessing
+        )
 
     for split in ['train', 'val', 'test']:
         print('Running preprocessing for split =', split)
@@ -423,7 +440,7 @@ def make_criteo_data_and_loaders(args, offset_to_length_converter=False):
 
         if args.mlperf_bin_loader:
             lstr = args.processed_data_file.split("/")
-            d_path = "/".join(lstr[0:-1]) + "/" + lstr[-1].split(".")[0]
+            d_path = "/".join(lstr[0:-1]) + "/" + lstr[-1].split(".")[0] # + ("_batched" if args.batched_emb else "")
             train_file = d_path + "_train.bin"
             test_file = d_path + "_test.bin"
             # val_file = d_path + "_val.bin"
@@ -438,11 +455,12 @@ def make_criteo_data_and_loaders(args, offset_to_length_converter=False):
                 data_file=train_file,
                 counts_file=counts_file,
                 batch_size=args.mini_batch_size,
-                max_ind_range=args.max_ind_range
+                max_ind_range=args.max_ind_range,
+                batched_emb=args.batched_emb
             )
 
             mlperf_logger.log_event(key=mlperf_logger.constants.TRAIN_SAMPLES,
-                                    value=train_data.num_samples)
+                                    value=train_data.num_entries)
 
             train_loader = torch.utils.data.DataLoader(
                 train_data,
@@ -451,7 +469,7 @@ def make_criteo_data_and_loaders(args, offset_to_length_converter=False):
                 shuffle=False,
                 num_workers=0,
                 collate_fn=None,
-                pin_memory=False,
+                pin_memory=args.pin_memory,
                 drop_last=False,
                 sampler=RandomSampler(train_data) if args.mlperf_bin_shuffle else None
             )
@@ -460,11 +478,12 @@ def make_criteo_data_and_loaders(args, offset_to_length_converter=False):
                 data_file=test_file,
                 counts_file=counts_file,
                 batch_size=args.test_mini_batch_size,
-                max_ind_range=args.max_ind_range
+                max_ind_range=args.max_ind_range,
+                batched_emb=args.batched_emb
             )
 
             mlperf_logger.log_event(key=mlperf_logger.constants.EVAL_SAMPLES,
-                                    value=test_data.num_samples)
+                                    value=test_data.num_entries)
 
             test_loader = torch.utils.data.DataLoader(
                 test_data,
@@ -473,7 +492,7 @@ def make_criteo_data_and_loaders(args, offset_to_length_converter=False):
                 shuffle=False,
                 num_workers=0,
                 collate_fn=None,
-                pin_memory=False,
+                pin_memory=args.pin_memory,
                 drop_last=False,
             )
         else:
@@ -555,7 +574,7 @@ def make_criteo_data_and_loaders(args, offset_to_length_converter=False):
             shuffle=False,
             num_workers=args.num_workers,
             collate_fn=collate_wrapper_criteo,
-            pin_memory=False,
+            pin_memory=args.pin_memory,
             drop_last=False,  # True
         )
 
@@ -565,7 +584,7 @@ def make_criteo_data_and_loaders(args, offset_to_length_converter=False):
             shuffle=False,
             num_workers=args.test_num_workers,
             collate_fn=collate_wrapper_criteo,
-            pin_memory=False,
+            pin_memory=args.pin_memory,
             drop_last=False,  # True
         )
 
@@ -574,7 +593,6 @@ def make_criteo_data_and_loaders(args, offset_to_length_converter=False):
 
 # uniform ditribution (input data)
 class RandomDataset(Dataset):
-
     def __init__(
             self,
             m_den,
@@ -584,18 +602,22 @@ class RandomDataset(Dataset):
             mini_batch_size,
             num_indices_per_lookup,
             num_indices_per_lookup_fixed,
+            batched_emb,
             num_targets=1,
             round_targets=False,
             data_generation="random",
             trace_file="",
             enable_padding=False,
+            bin_loader=False,
             reset_seed_on_access=False,
+            rand_seed=0,
             rand_data_dist="uniform",
             rand_data_min=1,
             rand_data_max=1,
             rand_data_mu=-1,
             rand_data_sigma=1,
-            rand_seed=0
+            data_directory="",
+            from_dataset=True
     ):
         # compute batch size
         nbatches = int(np.ceil((data_size * 1.0) / mini_batch_size))
@@ -605,6 +627,7 @@ class RandomDataset(Dataset):
             # print("Total number of batches %d" % nbatches)
 
         # save args (recompute data_size if needed)
+        self.total_data_batches = 10 # Hard-coded for now
         self.m_den = m_den
         self.ln_emb = ln_emb
         self.data_size = data_size
@@ -612,6 +635,7 @@ class RandomDataset(Dataset):
         self.mini_batch_size = mini_batch_size
         self.num_indices_per_lookup = num_indices_per_lookup
         self.num_indices_per_lookup_fixed = num_indices_per_lookup_fixed
+        self.batched_emb = batched_emb
         self.num_targets = num_targets
         self.round_targets = round_targets
         self.data_generation = data_generation
@@ -624,59 +648,195 @@ class RandomDataset(Dataset):
         self.rand_data_max = rand_data_max
         self.rand_data_mu = rand_data_mu
         self.rand_data_sigma = rand_data_sigma
+        self.n_spa = len(self.ln_emb)
+        self.data_directory = data_directory
+        self.bin = bin_loader # Borrow the mlperf_bin_loader flag
+        self.from_dataset = from_dataset if not self.bin or num_indices_per_lookup_fixed else False # Only make the dataset and load from it if the num of indices per lookup is fixed (so that the tensors can be stacked)
+
+        # Generate dataset and store for future use, instead of generating on the fly
+        if self.from_dataset:
+            if self.bin:
+                self.random_data_file_suffix = '{}_{}_{}_{}_{}_{}.bin'.format(self.total_data_batches,
+                                                                                self.m_den,
+                                                                                '-'.join([str(x) for x in self.ln_emb]),
+                                                                                self.mini_batch_size,
+                                                                                self.num_indices_per_lookup,
+                                                                                self.num_indices_per_lookup_fixed)
+            else:
+                self.random_data_file_suffix = '{}_{}_{}_{}_{}'.format(self.m_den,
+                                                                        '-'.join([str(x) for x in self.ln_emb]),
+                                                                        self.mini_batch_size,
+                                                                        self.num_indices_per_lookup,
+                                                                        self.num_indices_per_lookup_fixed)
+
+            if self.data_directory == "":
+                self.data_directory = "./"
+            data_file = self.data_directory + '/' + self.random_data_file_suffix
+
+            if self.bin:
+                dataset_exist = path.exists(data_file)
+            else:
+                import os
+                dataset_exist = True
+                if not any(fname.startswith(self.random_data_file_suffix) for fname in os.listdir(self.data_directory)):
+                    dataset_exist = False
+
+            if not dataset_exist:
+                # nbatches: num of batches
+                # lX: list of dense features
+                # lS_offsets/indices: list of list of offsets/indices
+                # lT: probability
+                (nbatches, lX, lS_offsets, lS_indices, lT) = generate_random_data(  self.m_den,
+                                                                                    self.ln_emb,
+                                                                                    self.data_size,
+                                                                                    self.total_data_batches,
+                                                                                    self.mini_batch_size,
+                                                                                    self.num_indices_per_lookup,
+                                                                                    self.num_indices_per_lookup_fixed,
+                                                                                    num_targets=self.num_targets,
+                                                                                    round_targets=self.round_targets,
+                                                                                    data_generation=self.data_generation,
+                                                                                    trace_file=self.trace_file,
+                                                                                    enable_padding=self.enable_padding)
+                if self.bin:
+                    np_data = []
+                    for b in range(nbatches):
+                        np_data.append(np.concatenate([
+                            lT[b].reshape(-1, 1), # target comes first: (mini_batch_size, 1)
+                            lX[b], # dense features: (mini_batch_size, dense_feature_count)
+                            torch.stack(lS_offsets[b]).t().contiguous(), # offsets: (mini_batch_size, num_embedding_tables) -> [transpose]
+                            torch.stack(lS_indices[b]).reshape(-1, self.mini_batch_size, self.num_indices_per_lookup).permute(1, 0, 2).reshape(self.mini_batch_size, -1).contiguous()
+                        ], axis=1)) # indices: (num_embedding_tables, mini_batch_size * num_indices_per_lookup) -> (mini_batch_size, num_embedding_tables * num_indices_per_lookup), e.g. (8, 2048 * 100) -> (2048, 8 * 100)
+
+                    with open(data_file, 'wb') as f:
+                        f.write(np_data.tobytes())
+
+                    # dataset
+                    self.tot_fea = self.m_den + self.n_spa * (1 + self.num_indices_per_lookup) + 1
+                    self.bytes_per_entry = (4 * self.tot_fea * self.mini_batch_size)
+                    self.num_entries = self.num_batches
+
+                    self.file = open(data_file, 'rb')
+                else:
+                    for b in range(nbatches):
+                        fname = data_file + '_{}.hdf5'.format(b)
+                        X = torch.log(lX[b].type(torch.float32) + 1)
+                        lS_o = torch.stack(lS_offsets[b])
+                        lS_i = torch.stack(lS_indices[b])
+                        y = lT[b].view(-1, 1)
+
+                        with h5py.File(fname, 'w') as hf:
+                            _ = hf.create_dataset('X', data=X, shape=X.shape)
+                            _ = hf.create_dataset('lS_o', data=lS_o, shape=lS_o.shape)
+                            _ = hf.create_dataset('lS_i', data=lS_i, shape=lS_i.shape)
+                            _ = hf.create_dataset('y', data=y, shape=y.shape)
 
     def reset_numpy_seed(self, numpy_rand_seed):
         np.random.seed(numpy_rand_seed)
         # torch.manual_seed(numpy_rand_seed)
 
+    def _transform_features(self, X, offsets, indices, T):
+        X_batch = torch.log(X.clone().detach().type(torch.float32) + 1)
+        lS_o = offsets.clone().detach().type(torch.long).t() # transpose back to (mini_batch_size, num_embedding_tables)
+        lS_i = indices.clone().detach().type(torch.long).reshape(self.mini_batch_size, -1, self.num_indices_per_lookup).permute(1, 0, 2).reshape(-1, self.mini_batch_size * self.num_indices_per_lookup) # e.g. (2048, 8 * 100) -> (8, 2048 * 100)
+        T_batch = T.clone().detach().type(torch.float32).view(-1, 1)
+
+        if self.batched_emb:
+            indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
+            E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
+            offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]])], dim=0).int() # TODO: fix this
+            lS_i = indices
+            lS_o = offsets
+
+        return X_batch, lS_o, lS_i, T_batch
+
     def __getitem__(self, index):
+        with torch.autograd.profiler.record_function("module::get_batch_data"):
+            if isinstance(index, slice):
+                return [
+                    self[idx] for idx in range(
+                        index.start or 0, index.stop or len(self), index.step or 1
+                    )
+                ]
 
-        if isinstance(index, slice):
-            return [
-                self[idx] for idx in range(
-                    index.start or 0, index.stop or len(self), index.step or 1
-                )
-            ]
+            if self.from_dataset:
+                if self.bin:
+                    self.file.seek((index % self.total_data_batches) * self.bytes_per_entry, 0)
+                    raw_data = self.file.read(self.bytes_per_entry)
+                    array = np.frombuffer(raw_data, dtype=np.float32)
+                    tensor = torch.from_numpy(array).view((-1, self.tot_fea))
 
-        # WARNING: reset seed on access to first element
-        # (e.g. if same random samples needed across epochs)
-        if self.reset_seed_on_access and index == 0:
-            self.reset_numpy_seed(self.rand_seed)
+                    return self._transform_features(X=tensor[:, 1:(self.m_den+1)],
+                                                    offsets=tensor[:, (self.m_den+1):(self.m_den+1+self.n_spa)],
+                                                    indices=tensor[:, (self.m_den+1+self.n_spa):],
+                                                    T=tensor[:, 0])
+                else:
+                    fname = self.data_directory + '/' + self.random_data_file_suffix + '_{}.hdf5'.format(index % self.total_data_batches)
+                    with h5py.File(fname, 'r') as hf:
+                        X = torch.tensor(np.array(hf['X']))
+                        lS_o = torch.tensor(np.array(hf['lS_o']))
+                        lS_i = torch.tensor(np.array(hf['lS_i']))
+                        y = torch.tensor(np.array(hf['y']))
 
-        # number of data points in a batch
-        n = min(self.mini_batch_size, self.data_size - (index * self.mini_batch_size))
+                    if self.batched_emb:
+                        indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
+                        E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
+                        offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]])], dim=0).int() # TODO: fix this
+                        lS_i = indices
+                        lS_o = offsets
 
-        # generate a batch of dense and sparse features
-        if self.data_generation == "random":
-            (X, lS_o, lS_i) = generate_dist_input_batch(
-                self.m_den,
-                self.ln_emb,
-                n,
-                self.num_indices_per_lookup,
-                self.num_indices_per_lookup_fixed,
-                rand_data_dist=self.rand_data_dist,
-                rand_data_min=self.rand_data_min,
-                rand_data_max=self.rand_data_max,
-                rand_data_mu=self.rand_data_mu,
-                rand_data_sigma=self.rand_data_sigma,
-            )
-        elif self.data_generation == "synthetic":
-            (X, lS_o, lS_i) = generate_synthetic_input_batch(
-                self.m_den,
-                self.ln_emb,
-                n,
-                self.num_indices_per_lookup,
-                self.num_indices_per_lookup_fixed,
-                self.trace_file,
-                self.enable_padding
-            )
-        else:
-            sys.exit(
-                "ERROR: --data-generation=" + self.data_generation + " is not supported"
-            )
+                    return X, lS_o, lS_i, y
+            else:
+                # WARNING: reset seed on access to first element
+                # (e.g. if same random samples needed across epochs)
+                if self.reset_seed_on_access and index == 0:
+                    self.reset_numpy_seed(self.rand_seed)
 
-        # generate a batch of target (probability of a click)
-        T = generate_random_output_batch(n, self.num_targets, self.round_targets)
+                # number of data points in a batch
+                n = min(self.mini_batch_size, self.data_size - (index * self.mini_batch_size))
+
+                # generate a batch of dense and sparse features
+                if self.data_generation == "random":
+                    (X, lS_o, lS_i) = generate_dist_input_batch(
+                        self.m_den,
+                        self.ln_emb,
+                        n,
+                        self.num_indices_per_lookup,
+                        self.num_indices_per_lookup_fixed,
+                        rand_data_dist=self.rand_data_dist,
+                        rand_data_min=self.rand_data_min,
+                        rand_data_max=self.rand_data_max,
+                        rand_data_mu=self.rand_data_mu,
+                        rand_data_sigma=self.rand_data_sigma,
+                    )
+                elif self.data_generation == "synthetic":
+                    (X, lS_o, lS_i) = generate_synthetic_input_batch(
+                        self.m_den,
+                        self.ln_emb,
+                        n,
+                        self.num_indices_per_lookup,
+                        self.num_indices_per_lookup_fixed,
+                        self.trace_file,
+                        self.enable_padding
+                    )
+                else:
+                    sys.exit(
+                        "ERROR: --data-generation=" + self.data_generation + " is not supported"
+                    )
+
+                # generate a batch of target (probability of a click)
+                T = generate_random_output_batch(n, self.num_targets, self.round_targets)
+
+                if self.batched_emb:
+                    # lS_i: List of T tensors with size <= B * L, each of which contains concatenated indices segments with variable lengths, as L is never fixed
+                    # -> indices (T * B * L)
+                    # lS_o: List of T tensors with size (B), each of which contains B offsets with variable difference between each consecutive pair of them, as L is never fixed
+                    # -> offsets (T * B + 1)
+                    indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
+                    E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
+                    offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]])], dim=0).int() # TODO: fix this
+                    lS_i = indices
+                    lS_o = offsets
 
         return (X, lS_o, lS_i, T)
 
@@ -690,7 +850,7 @@ def collate_wrapper_random_offset(list_of_tuples):
     # where each tuple is (X, lS_o, lS_i, T)
     (X, lS_o, lS_i, T) = list_of_tuples[0]
     return (X,
-            torch.stack(lS_o),
+            torch.stack(lS_o) if isinstance(lS_o, list) else lS_o,
             lS_i,
             T)
 
@@ -716,18 +876,21 @@ def make_random_data_and_loader(args, ln_emb, m_den,
         args.mini_batch_size,
         args.num_indices_per_lookup,
         args.num_indices_per_lookup_fixed,
+        args.batched_emb,
         1,  # num_targets
         args.round_targets,
         args.data_generation,
         args.data_trace_file,
         args.data_trace_enable_padding,
+        args.mlperf_bin_loader,
         reset_seed_on_access=True,
         rand_data_dist=args.rand_data_dist,
         rand_data_min=args.rand_data_min,
         rand_data_max=args.rand_data_max,
         rand_data_mu=args.rand_data_mu,
         rand_data_sigma=args.rand_data_sigma,
-        rand_seed=args.numpy_rand_seed
+        rand_seed=args.numpy_rand_seed,
+        data_directory=args.processed_data_file
     )  # WARNING: generates a batch of lookups at once
 
     test_data = RandomDataset(
@@ -738,6 +901,7 @@ def make_random_data_and_loader(args, ln_emb, m_den,
         args.mini_batch_size,
         args.num_indices_per_lookup,
         args.num_indices_per_lookup_fixed,
+        args.batched_emb,
         1,  # num_targets
         args.round_targets,
         args.data_generation,
@@ -749,7 +913,8 @@ def make_random_data_and_loader(args, ln_emb, m_den,
         rand_data_max=args.rand_data_max,
         rand_data_mu=args.rand_data_mu,
         rand_data_sigma=args.rand_data_sigma,
-        rand_seed=args.numpy_rand_seed
+        rand_seed=args.numpy_rand_seed,
+        data_directory=args.processed_data_file
     )
 
     collate_wrapper_random = collate_wrapper_random_offset
@@ -762,7 +927,7 @@ def make_random_data_and_loader(args, ln_emb, m_den,
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=collate_wrapper_random,
-        pin_memory=False,
+        pin_memory=args.pin_memory,
         drop_last=False,  # True
     )
 
@@ -877,20 +1042,26 @@ def generate_uniform_input_batch(
         lS_batch_indices = []
         offset = 0
         for _ in range(n):
-            # num of sparse indices to be used per embedding (between
+            # num of sparse indices to be used per embedding
             if num_indices_per_lookup_fixed:
                 sparse_group_size = np.int64(num_indices_per_lookup)
+                # sparse indices to be used per embedding, loop until there are no duplicates so that the num of sparse indices is acutally FIXED
+                while True:
+                    r = ra.random(sparse_group_size)
+                    sparse_group = np.unique(np.round(r * (size - 1)).astype(np.int64))
+                    if sparse_group.size == num_indices_per_lookup:
+                        break
             else:
                 # random between [1,num_indices_per_lookup])
                 r = ra.random(1)
                 sparse_group_size = np.int64(
                     np.round(max([1.0], r * min(size, num_indices_per_lookup)))
                 )
-            # sparse indices to be used per embedding
-            r = ra.random(sparse_group_size)
-            sparse_group = np.unique(np.round(r * (size - 1)).astype(np.int64))
-            # reset sparse_group_size in case some index duplicates were removed
-            sparse_group_size = np.int32(sparse_group.size)
+                # sparse indices to be used per embedding
+                r = ra.random(sparse_group_size)
+                sparse_group = np.unique(np.round(r * (size - 1)).astype(np.int64))
+                # reset sparse_group_size in case some index duplicates were removed
+                sparse_group_size = np.int32(sparse_group.size)
             # store lengths and indices
             if length: # for caffe2 version
                 lS_batch_offsets += [sparse_group_size]
@@ -959,10 +1130,15 @@ def generate_dist_input_batch(
             # store lengths and indices
             lS_batch_offsets += [offset]
             lS_batch_indices += sparse_group.tolist()
+            # print(len(lS_batch_offsets))
+            # print(len(lS_batch_indices))
             # update offset for next iteration
             offset += sparse_group_size
+        # print("-------")
         lS_emb_offsets.append(torch.tensor(lS_batch_offsets))
         lS_emb_indices.append(torch.tensor(lS_batch_indices))
+        # print(len(torch.tensor(lS_batch_offsets)))
+        # print(len(torch.tensor(lS_batch_indices)))
 
     return (Xt, lS_emb_offsets, lS_emb_indices)
 
