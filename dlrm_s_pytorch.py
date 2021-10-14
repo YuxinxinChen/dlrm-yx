@@ -1203,6 +1203,11 @@ def run():
     global writer
     args = parser.parse_args()
 
+    if args.dataset_multiprocessing:
+        assert float(sys.version[:3]) > 3.7, "The dataset_multiprocessing " + \
+        "flag is susceptible to a bug in Python 3.7 and under. " + \
+        "https://github.com/facebookresearch/dlrm/issues/172"
+
     if args.mlperf_logging:
         mlperf_logger.log_event(key=mlperf_logger.constants.CACHE_CLEAR, value=True)
         mlperf_logger.log_start(
@@ -1222,6 +1227,10 @@ def run():
         if args.md_flag:
             sys.exit(
                 "ERROR: 4 and 8-bit quantization with mixed dimensions is not supported"
+            )
+        if args.use_gpu:
+            sys.exit(
+                "ERROR: 4 and 8-bit quantization on GPU is not supported"
             )
 
     ### some basic setup ###
@@ -1292,9 +1301,9 @@ def run():
         # input and target at random
         ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
         m_den = ln_bot[0]
-        train_data, train_ld = dp.make_random_data_and_loader(args, ln_emb, m_den)
+        train_data, train_ld, test_data, test_ld = dp.make_random_data_and_loader(args, ln_emb, m_den)
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
-        print("ln_emb: ", ln_emb)
+        nbatches_test = len(test_ld)
 
     args.ln_emb = ln_emb.tolist()
     if args.mlperf_logging:
@@ -1634,9 +1643,6 @@ def run():
         if args.quantize_emb_with_bit != 32:
             dlrm.quantize_embedding(args.quantize_emb_with_bit)
             # print(dlrm)
-        assert (
-            args.data_generation == "dataset"
-        ), "currently only dataset loader provides testset"
 
     print("time/loss/accuracy (if enabled):")
     if args.mlperf_logging:
@@ -1665,7 +1671,9 @@ def run():
     writer = SummaryWriter(tb_file)
 
     ext_dist.barrier()
-    with torch.autograd.profiler.profile(args.enable_profiling, use_cuda=use_gpu, use_kineto=True) as prof:
+    with torch.autograd.profiler.profile(
+        args.enable_profiling, use_cuda=use_gpu, use_kineto=True, record_shapes=False
+    ) as prof:
         if not args.inference_only:
             k = 0
             total_time_begin = 0

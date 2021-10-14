@@ -893,6 +893,30 @@ def make_random_data_and_loader(args, ln_emb, m_den,
         data_directory=args.processed_data_file
     )  # WARNING: generates a batch of lookups at once
 
+    test_data = RandomDataset(
+        m_den,
+        ln_emb,
+        args.data_size,
+        args.num_batches,
+        args.mini_batch_size,
+        args.num_indices_per_lookup,
+        args.num_indices_per_lookup_fixed,
+        args.batched_emb,
+        1,  # num_targets
+        args.round_targets,
+        args.data_generation,
+        args.data_trace_file,
+        args.data_trace_enable_padding,
+        reset_seed_on_access=True,
+        rand_data_dist=args.rand_data_dist,
+        rand_data_min=args.rand_data_min,
+        rand_data_max=args.rand_data_max,
+        rand_data_mu=args.rand_data_mu,
+        rand_data_sigma=args.rand_data_sigma,
+        rand_seed=args.numpy_rand_seed,
+        data_directory=args.processed_data_file
+    )
+
     collate_wrapper_random = collate_wrapper_random_offset
     if offset_to_length_converter:
         collate_wrapper_random = collate_wrapper_random_length
@@ -906,7 +930,17 @@ def make_random_data_and_loader(args, ln_emb, m_den,
         pin_memory=args.pin_memory,
         drop_last=False,  # True
     )
-    return train_data, train_loader
+
+    test_loader = torch.utils.data.DataLoader(
+        test_data,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_wrapper_random,
+        pin_memory=False,
+        drop_last=False,  # True
+    )
+    return train_data, train_loader, test_data, test_loader
 
 
 def generate_random_data(
@@ -1328,7 +1362,7 @@ def write_trace_to_file(file_path, trace):
                 np.array(trace).astype(np.uint64).tofile(f)
         else:
             with open(file_path, "w+") as f:
-                s = str(trace)
+                s = str(list(trace))
                 f.write(s[1 : len(s) - 1])
     except Exception:
         print("ERROR: no output trace file has been provided")
@@ -1339,7 +1373,7 @@ def read_dist_from_file(file_path):
         with open(file_path, "r") as f:
             lines = f.read().splitlines()
     except Exception:
-        print("Wrong file or file path")
+        print("{file_path} Wrong file or file path")
     # read unique accesses
     unique_accesses = [int(el) for el in lines[0].split(", ")]
     # read cumulative distribution (elements are passed as two separate lists)
@@ -1353,13 +1387,13 @@ def write_dist_to_file(file_path, unique_accesses, list_sd, cumm_sd):
     try:
         with open(file_path, "w") as f:
             # unique_acesses
-            s = str(unique_accesses)
+            s = str(list(unique_accesses))
             f.write(s[1 : len(s) - 1] + "\n")
             # list_sd
             s = str(list_sd)
             f.write(s[1 : len(s) - 1] + "\n")
             # cumm_sd
-            s = str(cumm_sd)
+            s = str(list(cumm_sd))
             f.write(s[1 : len(s) - 1] + "\n")
     except Exception:
         print("Wrong file or file path")
@@ -1422,7 +1456,7 @@ if __name__ == "__main__":
     ### write stack_distance and line_accesses to a file ###
     write_dist_to_file(args.dist_file, line_accesses, list_sd, cumm_sd)
 
-    ### generate correspondinf synthetic ###
+    ### generate corresponding synthetic ###
     # line_accesses, list_sd, cumm_sd = read_dist_from_file(args.dist_file)
     synthetic_trace = trace_generate_lru(
         line_accesses, list_sd, cumm_sd, len(trace), args.trace_enable_padding
