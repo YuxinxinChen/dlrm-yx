@@ -110,16 +110,19 @@ from torchviz import make_dot
 
 from torch.optim.lr_scheduler import _LRScheduler
 
-import graph_observer
-from caffe2.python import core
-core.GlobalInit(
-    [
-        "python",
-        "--pytorch_enable_execution_graph_observer=true",
-        "--pytorch_execution_graph_observer_iter_label=## BENCHMARK ##",
-    ]
-)
-import GPUtil
+try:
+    import graph_observer
+    from caffe2.python import core
+    core.GlobalInit(
+        [
+            "python",
+            "--pytorch_enable_execution_graph_observer=true",
+            "--pytorch_execution_graph_observer_iter_label=## BENCHMARK ##",
+        ]
+    )
+    import GPUtil
+except:
+    print("graph_observer and GPUitl NOT imported")
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 

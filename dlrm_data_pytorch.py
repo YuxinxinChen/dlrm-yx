@@ -19,6 +19,7 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # others
+import os
 from os import path
 import sys
 import bisect
@@ -867,6 +868,8 @@ def collate_wrapper_random_length(list_of_tuples):
 def make_random_data_and_loader(args, ln_emb, m_den,
     offset_to_length_converter=False,
 ):
+    if not path.exists(args.processed_data_file):
+        os.makedirs(args.processed_data_file)
 
     train_data = RandomDataset(
         m_den,
