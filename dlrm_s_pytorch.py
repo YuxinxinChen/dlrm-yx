@@ -313,6 +313,34 @@ class DLRM_Net(nn.Module):
             stochastic_rounding=False,
         ), [None] * T
 
+    def create_emb_fbgemm(self, D, Es, weighted_pooling=None):
+        assert weighted_pooling is None, "Weighted pooling not supported yet!" # TODO: Fix this.
+        from fbgemm_gpu import split_table_batched_embeddings_ops
+        from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+        T = len(Es)
+
+        if ext_dist.my_size > 1:
+            emb_indices = [i for i in range(T) if i in self.local_emb_indices]
+        else:
+            emb_indices = [i for i in range(T)]
+
+        return split_table_batched_embeddings_ops.SplitTableBatchedEmbeddingBagsCodegen(
+            [
+                (
+                    Es[i],
+                    D,
+                    split_table_batched_embeddings_ops.EmbeddingLocation.DEVICE,
+                    split_table_batched_embeddings_ops.ComputeDevice.CUDA,
+                )
+                for i in emb_indices
+            ],
+            optimizer=OptimType.EXACT_SGD,
+            cache_algorithm=split_table_batched_embeddings_ops.CacheAlgorithm.LFU,
+            cache_reserved_memory=8.0,
+            eps=0.01,
+            device=None
+        ), [None] * T
+
     def __init__(
         self,
         m_spa=None,
@@ -334,7 +362,8 @@ class DLRM_Net(nn.Module):
         md_threshold=200,
         weighted_pooling=None,
         loss_function="bce",
-        batched_emb=False
+        batched_emb=False,
+        fbgemm_emb=False,
     ):
         super(DLRM_Net, self).__init__()
 
@@ -376,8 +405,9 @@ class DLRM_Net(nn.Module):
             if self.md_flag:
                 self.md_threshold = md_threshold
 
-            # use table batched embedding
+            # use table batched embedding or fbgemm embedding
             self.batched_emb = batched_emb
+            self.fbgemm_emb = fbgemm_emb
 
             # If running distributed, get local slice of embedding tables
             if ext_dist.my_size > 1:
@@ -404,6 +434,8 @@ class DLRM_Net(nn.Module):
             if ndevices <= 1:
                 if batched_emb:
                     self.emb_l, w_list = self.create_emb_batched(m_spa, ln_emb, weighted_pooling=weighted_pooling)
+                elif fbgemm_emb:
+                    self.emb_l, w_list = self.create_emb_fbgemm(m_spa, ln_emb, weighted_pooling=weighted_pooling)
                 else:
                     self.emb_l, w_list = self.create_emb(m_spa, ln_emb, weighted_pooling=weighted_pooling)
                 if self.weighted_pooling == "learned":
@@ -513,6 +545,14 @@ class DLRM_Net(nn.Module):
                 ly.append(E(indices, offset))
         return ly
 
+    def apply_emb_fbgemm(self, lS_o, lS_i, device_ids=None):
+        D = self.m_spa
+        inputs = tuple(zip(lS_i, lS_o))
+        ly = parallel_apply(self.emb_l, inputs, None, device_ids)
+        B, _ = ly[0].shape
+        ly = [y.reshape(B, -1, D) for y in ly]
+        return ly
+
     #  using quantizing functions from caffe2/aten/src/ATen/native/quantized/cpu
     def quantize_embedding(self, bits):
         n = len(self.emb_l) # TODO: Fix this for table batched embeddings
@@ -534,12 +574,12 @@ class DLRM_Net(nn.Module):
 
     def interact_features(self, x, ly):
         (batch_size, d) = x.shape
-        if self.batched_emb: # 2D [B, T*D] -> 3D [B, T, D] after All2All
-            D = self.emb_l[0].D
+        if self.batched_emb or self.fbgemm_emb: # 2D [B, T*D] -> 3D [B, T, D] after All2All
+            D = self.m_spa
             ly = [l.view(batch_size, -1, D) for l in ly]
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
-            if self.batched_emb:
+            if self.batched_emb or self.fbgemm_emb:
                 T = torch.cat([x.view(batch_size, 1, d)] + ly, dim=1) # ly is a list of output tensors on various devices from embedding lookup
             else:
                 T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
@@ -562,7 +602,7 @@ class DLRM_Net(nn.Module):
             R = torch.cat([x] + [Zflat], dim=1)
         elif self.arch_interaction_op == "cat":
             # concatenation features (into a row vector)
-            if self.batched_emb:
+            if self.batched_emb or self.fbgemm_emb:
                 R = torch.cat((x.view(batch_size, 1, d), ly), dim=1)
             else:
                 R = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
@@ -605,7 +645,7 @@ class DLRM_Net(nn.Module):
                 )
 
             dense_x = dense_x[ext_dist.get_my_slice(batch_size)]
-            if not self.batched_emb:
+            if not self.batched_emb and not self.fbgemm_emb:
                 lS_o = lS_o[self.local_emb_slice]
                 lS_i = lS_i[self.local_emb_slice]
 
@@ -618,6 +658,8 @@ class DLRM_Net(nn.Module):
         with record_function("module::forward_pass::embedding_lookup"):
             if self.batched_emb:
                 ly = self.apply_emb_batched(lS_o, lS_i)
+            elif self.fbgemm_emb:
+                ly = self.apply_emb_fbgemm(lS_o, lS_i)
             else:
                 ly = self.apply_emb(lS_o, lS_i)
 
@@ -629,7 +671,7 @@ class DLRM_Net(nn.Module):
             if len(self.emb_l) != len(ly):
                 sys.exit("ERROR: corrupted intermediate result in distributed_forward call")
 
-            a2a_req = ext_dist.alltoall(ly, self.n_emb_per_rank, self.batched_emb)
+            a2a_req = ext_dist.alltoall(ly, self.n_emb_per_rank, self.batched_emb or self.fbgemm_emb)
 
         with record_function("module::forward_pass::bottom_mlp"):
             x = self.apply_mlp(dense_x, self.bot_l)
@@ -668,6 +710,8 @@ class DLRM_Net(nn.Module):
         with torch.profiler.record_function("module::forward_pass::embedding_lookup"):
             if self.batched_emb:
                 ly = self.apply_emb_batched([lS_o], [lS_i]) # New apply_emb API accepts lists as inputs
+            elif self.fbgemm_emb:
+                ly = self.apply_emb_fbgemm([lS_o], [lS_i])
             else:
                 ly = self.apply_emb(lS_o, lS_i)
         # for y in ly:
@@ -695,7 +739,7 @@ class DLRM_Net(nn.Module):
             N.B.: We only consider reordering data for BATCHED embedding lookup for now.
         """
         B = batch_size
-        T = len(self.ln_emb) if self.batched_emb else len(self.emb_l)
+        T = len(self.ln_emb) if self.batched_emb or self.fbgemm_emb else len(self.emb_l)
         L = int(lS_i.shape[0] / B / T) # Assuming L is fixed
         ndevices = min(self.ndevices, batch_size, T)
         t_list = []
@@ -750,7 +794,7 @@ class DLRM_Net(nn.Module):
             # WARNING: # of devices must be >= batch size in parallel_forward call
             batch_size = dense_x.size()[0]
             B = batch_size
-            T = len(self.ln_emb) if self.batched_emb else len(self.emb_l)
+            T = len(self.ln_emb) if self.batched_emb or self.fbgemm_emb else len(self.emb_l)
             ndevices = min(self.ndevices, batch_size, T)
             device_ids = range(ndevices)
             # WARNING: must redistribute the model if mini-batch size changes(this is common
@@ -768,7 +812,7 @@ class DLRM_Net(nn.Module):
                 # distribute embeddings (model parallelism)
                 t_list = []
                 w_list = []
-                if self.batched_emb:
+                if self.batched_emb or self.fbgemm_emb:
                     tmp_t_list = []
                     for _ in range(ndevices):
                         tmp_t_list.append([])
@@ -776,7 +820,11 @@ class DLRM_Net(nn.Module):
                         tmp_t_list[self.device_indices[k]].append(sorted(self.ln_emb)[k])
                     for k, t in enumerate(tmp_t_list):
                         d = torch.device("cuda:" + str(k))
-                        emb, _ = self.create_emb_batched(self.m_spa, t, self.weighted_pooling) # Create batched embdding for tables distributed to each device
+                        if self.batched_emb:
+                            emb, _ = self.create_emb_batched(self.m_spa, t, self.weighted_pooling) # Create batched embdding for tables distributed to each device
+                        else:
+                            emb, _ = self.create_emb_fbgemm(self.m_spa, t, self.weighted_pooling) # Create batched embdding for tables distributed to each device
+
                         t_list.append(emb.to(d, non_blocking=True))
                     self.emb_l = nn.ModuleList(t_list) # Has length of # devices
                     # TODO: Fix v_W_l
@@ -804,7 +852,7 @@ class DLRM_Net(nn.Module):
             # distribute sparse features (model parallelism)
             t_list = []
             i_list = []
-            if self.batched_emb:
+            if self.batched_emb or self.fbgemm_emb:
                 for k in range(ndevices):
                     d = torch.device("cuda:" + str(k))
                     t_list.append(lS_o[k].to(d, non_blocking=True))
@@ -837,6 +885,8 @@ class DLRM_Net(nn.Module):
         with torch.profiler.record_function("module::forward_pass::embedding_lookup"):
             if self.batched_emb:
                 ly = self.apply_emb_batched(lS_o, lS_i, device_ids=device_ids) # In parallel_forward lS_o and lS_i are already lists
+            elif self.fbgemm_emb:
+                ly = self.apply_emb_fbgemm(lS_o, lS_i, device_ids=device_ids) # In parallel_forward lS_o and lS_i are already lists
             else:
                 ly = self.apply_emb(lS_o, lS_i)
             # debug prints
@@ -861,7 +911,7 @@ class DLRM_Net(nn.Module):
             #   list (non-batched) or tensor (batched) of partial output across the batch dimension of table 0, table 1, table 2... # device 0
             #   list (non-batched) or tensor (batched) of partial output across the batch dimension of table 0, table 1, table 2... # device 1
             # ]
-            if self.batched_emb:
+            if self.batched_emb or self.fbgemm_emb:
                 ly = list(map(lambda y: torch.cat(y, dim=1), zip(*t_list))) # e.g., [1024, 4, 64] & [1024, 4, 64] = [1024, 8, 64] per device, tables OUT OF ORDER, e.g. [[0, 2, 3], [1, 4, 5]]
                 device_table_list = [] # Which device processed which tables
                 for _ in range(ndevices):
@@ -877,7 +927,7 @@ class DLRM_Net(nn.Module):
 
         # interactions
         with torch.profiler.record_function("module::forward_pass::interaction"):
-            inputs = [(xx, [yy] if self.batched_emb else yy) for xx, yy in zip(x, ly)]
+            inputs = [(xx, [yy] if self.batched_emb or self.fbgemm_emb else yy) for xx, yy in zip(x, ly)]
             z = parallel_apply([self.interact_features] * ndevices, inputs, None, device_ids)
             # debug prints
             # print(z)
@@ -957,7 +1007,7 @@ def inference(
             testBatch
         )
         with record_function("DLRM distribute emb data"):
-            if dlrm.batched_emb:
+            if dlrm.batched_emb or dlrm.fbgemm_emb:
                 if ndevices > 1 or ext_dist.my_size > 1:
                     lS_o_test, lS_i_test = dlrm.distribute_batched_emb_data(X_test.size()[0], lS_o_test, lS_i_test)
 
@@ -1106,6 +1156,7 @@ def run():
     parser.add_argument("--qr-operation", type=str, default="mult")
     parser.add_argument("--qr-collisions", type=int, default=4)
     parser.add_argument("--batched-emb", action="store_true", default=False)
+    parser.add_argument("--fbgemm-emb", action="store_true", default=False)
     # activations and loss
     parser.add_argument("--activation-function", type=str, default="relu")
     parser.add_argument("--loss-function", type=str, default="mse")  # or bce or wbce
@@ -1337,6 +1388,12 @@ def run():
     arch_mlp_top_adjusted = str(num_int) + "-" + args.arch_mlp_top
     ln_top = np.fromstring(arch_mlp_top_adjusted, dtype=int, sep="-")
 
+    # Can only specify both batched-emb and fbgemm emb
+    if args.batched_emb and args.fbgemm_emb:
+        sys.exit(
+            "ERROR: Can not have both --batched-emb and --fbgemm-emb"
+        )
+
     # sanity check: feature sizes and mlp dimensions must match
     if m_den != ln_bot[0]:
         sys.exit(
@@ -1444,8 +1501,9 @@ def run():
     global ndevices
     ndevices = min(ngpus, args.mini_batch_size, num_fea - 1) if use_gpu else -1
 
-    # Only support GPU training for batched_emb
+    # Only support GPU training for batched_emb or fbgemm_emb
     assert not (args.batched_emb and not args.use_gpu)
+    assert not (args.fbgemm_emb and not args.use_gpu)
 
     ### construct the neural network specified above ###
     # WARNING: to obtain exactly the same initialization for
@@ -1473,6 +1531,7 @@ def run():
         weighted_pooling=args.weighted_pooling,
         loss_function=args.loss_function,
         batched_emb=args.batched_emb,
+        fbgemm_emb=args.fbgemm_emb,
     )
 
     # test prints
@@ -1484,7 +1543,7 @@ def run():
 
     if use_gpu:
         dlrm = dlrm.to(device, non_blocking=True)  # .cuda()
-        if dlrm.ndevices > 1 and not ext_dist.my_size > 1 and not args.batched_emb:
+        if dlrm.ndevices > 1 and not ext_dist.my_size > 1 and not args.batched_emb and not args.fbgemm_emb:
             dlrm.emb_l, dlrm.v_W_l = dlrm.create_emb(
                 m_spa, ln_emb, args.weighted_pooling
             )
@@ -1518,7 +1577,7 @@ def run():
             if ext_dist.my_size == 1
             else [
                 {
-                    "params": [p for p in dlrm.emb_l.parameters()] if args.batched_emb else [p for emb in dlrm.emb_l for p in emb.parameters()],
+                    "params": [p for p in dlrm.emb_l.parameters()] if args.batched_emb or args.fbgemm_emb else [p for emb in dlrm.emb_l for p in emb.parameters()],
                     "lr": args.learning_rate,
                 },
                 # TODO check this lr setup
@@ -1727,7 +1786,7 @@ def run():
 
                         X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
                         with record_function("DLRM distribute emb data"):
-                            if dlrm.batched_emb:
+                            if dlrm.batched_emb or dlrm.fbgemm_emb:
                                 if ndevices > 1 or ext_dist.my_size > 1:
                                     lS_o, lS_i = dlrm.distribute_batched_emb_data(X.size()[0], lS_o, lS_i)
 
