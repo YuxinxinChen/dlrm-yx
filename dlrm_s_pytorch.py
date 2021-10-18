@@ -806,7 +806,7 @@ class DLRM_Net(nn.Module):
             i_list = []
             if self.batched_emb:
                 for k in range(ndevices):
-                    d = torch.device("cuda:" + str(self.device_indices[k]))
+                    d = torch.device("cuda:" + str(k))
                     t_list.append(lS_o[k].to(d, non_blocking=True))
                     i_list.append(lS_i[k].to(d, non_blocking=True))
             else:
@@ -1484,9 +1484,14 @@ def run():
 
     if use_gpu:
         dlrm = dlrm.to(device, non_blocking=True)  # .cuda()
-        if dlrm.weighted_pooling == "fixed":
-            for k, w in enumerate(dlrm.v_W_l):
-                dlrm.v_W_l[k] = w.cuda()
+        if dlrm.ndevices > 1 and not ext_dist.my_size > 1 and not args.batched_emb:
+            dlrm.emb_l, dlrm.v_W_l = dlrm.create_emb(
+                m_spa, ln_emb, args.weighted_pooling
+            )
+        else:
+            if dlrm.weighted_pooling == "fixed":
+                for k, w in enumerate(dlrm.v_W_l):
+                    dlrm.v_W_l[k] = w.cuda()
 
     # distribute data parallel mlps
     if ext_dist.my_size > 1:
