@@ -66,23 +66,6 @@ def get_split_lengths(n):
     return (my_len, splits)
 
 
-# get device indices for tables
-# e.g 8 tables, No. [1,3,5,6] on device 0, No. [2,4,7,8] on device 1, then
-# return [0, 1, 0, 1, 0, 0, 1, 1]
-def get_device_indices_for_tables(T, Es, ndevices, balance_type="simple"):
-    if balance_type == "simple": # Simple greedy load balancing
-        buckets = [0] * ndevices
-        table_device_indices = [0] * T # Mapping of embedding tables to devices
-        for k, E in enumerate(Es):
-            device_idx = buckets.index(min(buckets))
-            buckets[device_idx] += E
-            table_device_indices[k] = device_idx # Which table goes to which device
-        return table_device_indices
-    elif balance_type == "naive":
-        return [(x % ndevices) for x in Es]
-    raise Exception("Unknown load balancing type!")
-
-
 def init_distributed(rank=-1, local_rank=-1, size=-1, use_gpu=False, backend=""):
     global myreq
     global my_rank

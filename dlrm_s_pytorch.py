@@ -70,6 +70,9 @@ import warnings
 # data generation
 import dlrm_data_pytorch as dp
 
+# Sharders
+import sharders
+
 # For distributed run
 import extend_distributed as ext_dist
 import mlperf_logger
@@ -364,6 +367,7 @@ class DLRM_Net(nn.Module):
         loss_function="bce",
         batched_emb=False,
         fbgemm_emb=False,
+        sharder=None,
     ):
         super(DLRM_Net, self).__init__()
 
@@ -409,6 +413,9 @@ class DLRM_Net(nn.Module):
             self.batched_emb = batched_emb
             self.fbgemm_emb = fbgemm_emb
 
+            # Sharding algorithm
+            self.sharder = sharder
+
             # If running distributed, get local slice of embedding tables
             if ext_dist.my_size > 1:
                 n_emb = len(ln_emb)
@@ -418,11 +425,16 @@ class DLRM_Net(nn.Module):
                         % (n_emb, ext_dist.my_size)
                     )
                 self.n_global_emb = n_emb
-                self.n_local_emb, self.n_emb_per_rank = ext_dist.get_split_lengths(
-                    n_emb
-                )
-                self.local_emb_slice = ext_dist.get_my_slice(n_emb)
-                self.local_emb_indices = list(range(n_emb))[self.local_emb_slice]
+                T = len(self.ln_emb)
+                self.device_indices = sharders.shard(T, sorted(self.ln_emb), ext_dist.my_size, sharder)
+                print("Sharding:", self.device_indices)
+                self.n_emb_per_rank = [self.device_indices.count(i) for i in range(ext_dist.my_size)]
+                self.local_emb_indices = [i for i, j in enumerate(self.device_indices) if j == ext_dist.my_local_rank]
+                #self.n_local_emb, self.n_emb_per_rank = ext_dist.get_split_lengths(
+                #    n_emb
+                #)
+                #self.local_emb_slice = ext_dist.get_my_slice(n_emb)
+                #self.local_emb_indices = list(range(n_emb))[self.local_emb_slice]
 
             # Create operators
             # Custom Model-Data Parallel
@@ -449,7 +461,8 @@ class DLRM_Net(nn.Module):
                     N.B.: Tables can be sorted but don't necessarily come in order.
                 """
                 T = len(self.ln_emb)
-                self.device_indices = ext_dist.get_device_indices_for_tables(T, sorted(self.ln_emb), ndevices)
+                self.device_indices = sharders.shard(T, sorted(self.ln_emb), ndevices, sharder)
+                print("Sharding:", self.device_indices)
 
             # quantization
             self.quantize_emb = False
@@ -646,8 +659,8 @@ class DLRM_Net(nn.Module):
 
             dense_x = dense_x[ext_dist.get_my_slice(batch_size)]
             if not self.batched_emb and not self.fbgemm_emb:
-                lS_o = lS_o[self.local_emb_slice]
-                lS_i = lS_i[self.local_emb_slice]
+                lS_o = lS_o[self.local_emb_indices]
+                lS_i = lS_i[self.local_emb_indices]
 
                 if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
                     sys.exit(
@@ -755,7 +768,7 @@ class DLRM_Net(nn.Module):
         tmp_i = []
         # TODO: Fix for multi-node multi-GPU
         if ext_dist.my_size > 1: # Distributed training
-            for _, tmp in enumerate(tmp_list[self.local_emb_slice]):
+            for _, tmp in enumerate([tmp_list[i] for i in self.local_emb_indices]):
                 o = tmp[1]
                 i = tmp[2]
                 if not tmp_o:
@@ -1133,6 +1146,9 @@ def run():
     parser = argparse.ArgumentParser(
         description="Train Deep Learning Recommendation Model (DLRM)"
     )
+    # Sharding algorith
+    parser.add_argument("--sharder", type=str, default="greedy")
+
     # model related parameters
     parser.add_argument("--arch-sparse-feature-size", type=int, default=2)
     parser.add_argument(
@@ -1532,6 +1548,7 @@ def run():
         loss_function=args.loss_function,
         batched_emb=args.batched_emb,
         fbgemm_emb=args.fbgemm_emb,
+        sharder=args.sharder
     )
 
     # test prints
