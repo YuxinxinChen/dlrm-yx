@@ -32,7 +32,7 @@ def greedy_shard(T, Es, ndevices):
 
 @register_sharder("hardcode")
 def hardcode_shard(T, Es, ndevices):
-    #return [0] + [1] * (T-1)
+    return [0] + [1] * (T-1)
     #return [0] * (T-1) + [1]
-    return [0] * int(T/2) + [1] * int(T/2)
+    #return [0] * int(T/2) + [1] * int(T/2)
 

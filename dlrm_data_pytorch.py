@@ -946,6 +946,87 @@ def make_random_data_and_loader(args, ln_emb, m_den,
     return train_data, train_loader, test_data, test_loader
 
 
+class ProcessedDataset(Dataset):
+    def __init__(
+            self,
+            processed_data_file,
+            total_num_batches,
+            batched_emb
+    ):
+        self.total_num_batches = total_num_batches
+        self.batched_emb = batched_emb
+        data = torch.load(os.path.join(processed_data_file, "data.pt"))
+        self.nbatches = data["nbatches"]
+        self.lX = data["lX"]
+        self.lS_offsets = data["lS_offsets"]
+        self.lS_indices = data["lS_indices"]
+        self.lT = data["lT"]
+
+    def __getitem__(self, index):
+        with torch.autograd.profiler.record_function("module::get_batch_data"):
+            if isinstance(index, slice):
+                return [
+                    self[idx] for idx in range(
+                        index.start or 0, index.stop or len(self), index.step or 1
+                    )
+                ]
+
+            X = self.lX[index % self.nbatches]
+            lS_o = self.lS_offsets[index % self.nbatches]
+            lS_i = self.lS_indices[index % self.nbatches]
+            T = self.lT[index % self.nbatches]
+
+            if self.batched_emb:
+                indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
+                E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
+                offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]])], dim=0).int() # TODO: fix this
+                lS_i = indices
+                lS_o = offsets
+
+            return X, lS_o, lS_i, T
+
+        return (X, lS_o, lS_i, T)
+
+    def __len__(self):
+        return self.total_num_batches
+
+def make_processed_data_and_loader(args):
+    train_data = ProcessedDataset(
+        args.processed_data_file,
+        args.num_batches,
+        args.batched_emb or args.fbgemm_emb
+    )
+
+    test_data = ProcessedDataset(
+        args.processed_data_file,
+        args.num_batches,
+        args.batched_emb or args.fbgemm_emb
+    )
+
+    collate_wrapper_random = collate_wrapper_random_offset
+
+    train_loader = torch.utils.data.DataLoader(
+        train_data,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_wrapper_random,
+        pin_memory=args.pin_memory,
+        drop_last=False,  # True
+    )
+
+    test_loader = torch.utils.data.DataLoader(
+        test_data,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_wrapper_random,
+        pin_memory=False,
+        drop_last=False,  # True
+    )
+    return train_data, train_loader, test_data, test_loader
+
+
 def generate_random_data(
     m_den,
     ln_emb,
