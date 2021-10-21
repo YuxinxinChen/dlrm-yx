@@ -31,6 +31,8 @@ def greedy_shard(T, Es, ndevices):
     return table_device_indices
 
 @register_sharder("hardcode")
-def naive_shard(T, Es, ndevices):
-    return [0] * (T-1) + [1]
+def hardcode_shard(T, Es, ndevices):
+    #return [0] + [1] * (T-1)
+    #return [0] * (T-1) + [1]
+    return [0] * int(T/2) + [1] * int(T/2)
 
