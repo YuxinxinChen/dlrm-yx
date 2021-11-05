@@ -628,7 +628,7 @@ class RandomDataset(Dataset):
             # print("Total number of batches %d" % nbatches)
 
         # save args (recompute data_size if needed)
-        self.total_data_batches = 10 # Hard-coded for now
+        self.total_data_batches = 1 # Hard-coded for now
         self.m_den = m_den
         self.ln_emb = ln_emb
         self.data_size = data_size

@@ -352,7 +352,7 @@ class DLRM_Net(nn.Module):
     def create_emb_fbgemm(self, Ds, Es, weighted_pooling=None):
         assert weighted_pooling is None, "Weighted pooling not supported yet!" # TODO: Fix this.
         from fbgemm_gpu import split_table_batched_embeddings_ops
-        from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+        from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType, SparseType
         T = len(Es)
 
         if ext_dist.my_size > 1:
@@ -377,7 +377,8 @@ class DLRM_Net(nn.Module):
             cache_algorithm=split_table_batched_embeddings_ops.CacheAlgorithm.LFU,
             cache_reserved_memory=8.0,
             eps=0.01,
-            device=None
+            device=None,
+            weights_precision=SparseType.FP16,
         ), [None] * T
 
     def __init__(
@@ -405,6 +406,7 @@ class DLRM_Net(nn.Module):
         fbgemm_emb=False,
         load_processed=False,
         sharder=None,
+        allocation=None,
     ):
         super(DLRM_Net, self).__init__()
 
@@ -464,7 +466,10 @@ class DLRM_Net(nn.Module):
                     )
                 self.n_global_emb = n_emb
                 T = len(self.ln_emb)
-                self.device_indices = sharders.shard(T, self.ln_emb, ext_dist.my_size, sharder)
+                if sharder == "input":
+                    self.device_indices = list(map(int, allocation.split(",")))
+                else:
+                    self.device_indices = sharders.shard(T, self.ln_emb, ext_dist.my_size, sharder)
                 print("Sharding:", self.device_indices)
 
                 if load_processed:
@@ -670,7 +675,7 @@ class DLRM_Net(nn.Module):
         elif self.arch_interaction_op == "cat":
             # concatenation features (into a row vector)
             if self.batched_emb or self.fbgemm_emb:
-                R = torch.cat((x.view(batch_size, 1, d), ly), dim=1)
+                R = torch.cat(([x.view(batch_size, 1, d)] + ly), dim=1)
             else:
                 R = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
         else:
@@ -1207,8 +1212,10 @@ def run():
     parser = argparse.ArgumentParser(
         description="Train Deep Learning Recommendation Model (DLRM)"
     )
+    parser.add_argument("--profile-out-dir", type=str, default="profiles/tmp")
     # Sharding algorith
     parser.add_argument("--sharder", type=str, default="greedy")
+    parser.add_argument("--allocation", type=str, default="")
 
     # Load generated data
     parser.add_argument("--load-processed", action="store_true", default=False)
@@ -1366,6 +1373,9 @@ def run():
             sys.exit(
                 "ERROR: 4 and 8-bit quantization on GPU is not supported"
             )
+
+    if not os.path.exists(args.profile_out_dir):
+        os.makedirs(args.profile_out_dir)
 
     ### some basic setup ###
     np.random.seed(args.numpy_rand_seed)
@@ -1635,7 +1645,8 @@ def run():
         batched_emb=args.batched_emb,
         fbgemm_emb=args.fbgemm_emb,
         load_processed=args.load_processed,
-        sharder=args.sharder
+        sharder=args.sharder,
+        allocation=args.allocation
     )
 
     # test prints
@@ -2156,11 +2167,11 @@ def run():
         if ext_dist.my_size > 1: # Multiple trace files for distributed training
             with open("dlrm_s_pytorch_{}.prof".format(ext_dist.my_local_rank), "w") as prof_f:
                 prof_f.write(prof.key_averages().table(sort_by="self_cpu_time_total"))
-            prof.export_chrome_trace("dlrm_s_pytorch_{}.json".format(ext_dist.my_local_rank))
+            prof.export_chrome_trace(os.path.join(args.profile_out_dir, "dlrm_s_pytorch_{}.json".format(ext_dist.my_local_rank)))
         else:
             with open("dlrm_s_pytorch.prof", "w") as prof_f:
                 prof_f.write(prof.key_averages().table(sort_by="self_cpu_time_total"))
-            prof.export_chrome_trace("dlrm_s_pytorch.json")
+            prof.export_chrome_trace(args.profile_out_dir(args.profile_out_dir, "dlrm_s_pytorch.json"))
         # print(prof.key_averages().table(sort_by="cpu_time_total"))
 
     # plot compute graph
