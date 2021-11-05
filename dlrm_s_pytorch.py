@@ -1374,9 +1374,6 @@ def run():
                 "ERROR: 4 and 8-bit quantization on GPU is not supported"
             )
 
-    if not os.path.exists(args.profile_out_dir):
-        os.makedirs(args.profile_out_dir)
-
     ### some basic setup ###
     np.random.seed(args.numpy_rand_seed)
     np.set_printoptions(precision=args.print_precision)
@@ -1394,6 +1391,10 @@ def run():
 
     if not args.debug_mode:
         ext_dist.init_distributed(local_rank=args.local_rank, use_gpu=use_gpu, backend=args.dist_backend)
+
+    if not os.path.exists(args.profile_out_dir):
+        if ext_dist.my_local_rank == 0:
+            os.makedirs(args.profile_out_dir)
 
     if use_gpu:
         torch.cuda.manual_seed_all(args.numpy_rand_seed)
@@ -1974,9 +1975,9 @@ def run():
                             if (args.mlperf_logging and (j + 1) % args.mlperf_grad_accum_iter == 0) or not args.mlperf_logging:
                                 optimizer.step()
                                 lr_scheduler.step()
+                            torch.cuda.synchronize()
 
                         if use_gpu:
-                            torch.cuda.synchronize()
                             end_event.record()
                             torch.cuda.synchronize()
                             total_time += start_event.elapsed_time(end_event) * 1.e-3
