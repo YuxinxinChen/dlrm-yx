@@ -1794,7 +1794,6 @@ def run():
                                 lr_scheduler.step()
 
                         if use_gpu:
-                            torch.cuda.synchronize()
                             end_event.record()
                             torch.cuda.synchronize()
                             total_time += start_event.elapsed_time(end_event) * 1.e-3
