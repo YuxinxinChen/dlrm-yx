@@ -229,8 +229,8 @@ class All2All_ScatterList_Req(Function):
             else a2a_info.local_batch_num
         )
         table_split_lengths = (
-            a2a_info.global_table_wise_parition_slices
-            if a2a_info.global_table_wise_parition_slices
+            a2a_info.global_table_wise_partition_slices
+            if a2a_info.global_table_wise_partition_slices
             else [a2a_info.local_table_num] * my_size
         )
         gather_list = []
@@ -286,8 +286,8 @@ class All2All_ScatterList_Wait(Function):
             else [a2a_info.local_batch_num] * my_size
         )
         per_rank_table_splits = (
-            a2a_info.global_table_wise_parition_slices
-            if a2a_info.global_table_wise_parition_slices
+            a2a_info.global_table_wise_partition_slices
+            if a2a_info.global_table_wise_partition_slices
             else [a2a_info.local_table_num] * my_size
         )
         grad_inputs = [
@@ -321,8 +321,8 @@ class All2All_Scatter_Req(Function):
             else a2a_info.local_batch_num
         )
         table_split_lengths = (
-            a2a_info.global_table_wise_parition_slices
-            if a2a_info.global_table_wise_parition_slices
+            a2a_info.global_table_wise_partition_slices
+            if a2a_info.global_table_wise_partition_slices
             else [a2a_info.local_table_num] * my_size
         )
         input = torch.cat(inputs, dim=1)
@@ -379,8 +379,8 @@ class All2All_Scatter_Wait(Function):
             else a2a_info.local_batch_num
         )
         table_split_lengths = (
-            a2a_info.global_table_wise_parition_slices
-            if a2a_info.global_table_wise_parition_slices
+            a2a_info.global_table_wise_partition_slices
+            if a2a_info.global_table_wise_partition_slices
             else [a2a_info.local_table_num] * my_size
         )
         grad_input = grad_output[0].new_empty(
@@ -407,17 +407,19 @@ class All2All_Req(Function):
         global myreq
         with record_function("DLRM alltoall_req_fwd_single"):
             batch_split_lengths = a2a_info.global_batch_partition_slices
+            # Usually empty
             if batch_split_lengths:
                 batch_split_lengths = [
                     m * a2a_info.emb_dim * a2a_info.local_table_num
                     for m in batch_split_lengths
                 ]
-            table_split_lengths = a2a_info.global_table_wise_parition_slices
+            # Usually not empty
+            table_split_lengths = a2a_info.global_table_wise_partition_slices
             if table_split_lengths:
                 table_split_lengths = [
                     a2a_info.local_batch_num * e * a2a_info.emb_dim
                     for e in table_split_lengths
-                ]
+                ] # Replace table split lengths with flatten 1D tensor size splits
             input = torch.cat(inputs, dim=1).view([-1])
             output = input.new_empty(
                 [
@@ -561,7 +563,7 @@ class All2AllInfo(object):
 #     batch_size, emb_dim = inputs[0].size()
 #     a2a_info = All2AllInfo()
 #     a2a_info.local_table_num = len(inputs)
-#     a2a_info.global_table_wise_parition_slices = per_rank_table_splits
+#     a2a_info.global_table_wise_partition_slices = per_rank_table_splits
 #     (
 #         a2a_info.local_batch_num,
 #         a2a_info.global_batch_partition_slices,
@@ -598,11 +600,12 @@ def alltoall(inputs, per_rank_table_splits, batched_emb=False):
     global myreq
     a2a_info = All2AllInfo()
     if batched_emb:
+        # B, T, D as output size of batched_emb
         a2a_info.batch_size, a2a_info.local_table_num, a2a_info.emb_dim = inputs[0].size()
     else:
         a2a_info.batch_size, a2a_info.emb_dim = inputs[0].size()
         a2a_info.local_table_num = len(inputs)
-    a2a_info.global_table_wise_parition_slices = per_rank_table_splits
+    a2a_info.global_table_wise_partition_slices = per_rank_table_splits
     (
         a2a_info.local_batch_num,
         a2a_info.global_batch_partition_slices,
