@@ -331,7 +331,8 @@ class DLRM_Net(nn.Module):
         md_threshold=200,
         weighted_pooling=None,
         loss_function="bce",
-        batched_emb=False
+        batched_emb=False,
+        emb_load_balancing="naive_chunk"
     ):
         super(DLRM_Net, self).__init__()
 
@@ -373,24 +374,6 @@ class DLRM_Net(nn.Module):
             if self.md_flag:
                 self.md_threshold = md_threshold
 
-            # use table batched embedding
-            self.batched_emb = batched_emb
-
-            # If running distributed, get local slice of embedding tables
-            if ext_dist.my_size > 1:
-                n_emb = len(ln_emb)
-                if n_emb < ext_dist.my_size:
-                    sys.exit(
-                        "only (%d) sparse features for (%d) devices, table partitions will fail"
-                        % (n_emb, ext_dist.my_size)
-                    )
-                self.n_global_emb = n_emb
-                self.n_local_emb, self.n_emb_per_rank = ext_dist.get_split_lengths(
-                    n_emb
-                )
-                self.local_emb_slice = ext_dist.get_my_slice(n_emb)
-                self.local_emb_indices = list(range(n_emb))[self.local_emb_slice]
-
             # Create operators
             # Custom Model-Data Parallel
             # the mlps are replicated and use data parallelism, while
@@ -398,7 +381,25 @@ class DLRM_Net(nn.Module):
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
 
+            # use table batched embedding
+            self.batched_emb = batched_emb
+
+            # load balancing type
+            self.emb_load_balancing = emb_load_balancing
+
             if ndevices <= 1:
+                if ext_dist.my_size > 1: # Multi-node (multi-process) single-GPU (distributed_forward), otherwise single-node
+                    n_emb = len(ln_emb)
+                    if n_emb < ext_dist.my_size:
+                        sys.exit(
+                            "only (%d) sparse features for (%d) devices, table partitions will fail"
+                            % (n_emb, ext_dist.my_size)
+                        )
+                    T = len(self.ln_emb)
+                    self.device_indices = ext_dist.get_device_indices_for_tables(T, sorted(self.ln_emb), ext_dist.my_size, balancing_type=self.emb_load_balancing)
+                    self.n_emb_per_rank = ext_dist.get_splits_from_device_indices(self.device_indices)
+                    self.n_local_emb = self.n_emb_per_rank[ext_dist.my_rank]
+                    self.local_emb_indices = ext_dist.get_my_emb_indices_from_device_indices(self.device_indices) # Replace the old self.local_emb_slice with this (list)
                 if batched_emb:
                     self.emb_l, w_list = self.create_emb_batched(m_spa, ln_emb, weighted_pooling=weighted_pooling)
                 else:
@@ -409,12 +410,15 @@ class DLRM_Net(nn.Module):
                         self.v_W_l.append(Parameter(w))
                 else:
                     self.v_W_l = w_list
-            else: # Multi GPU. TODO: Extend to multi-node multi-GPU.
+            else:
+                if ext_dist.my_size > 1: # Multi-node multi-GPU
+                    sys.exit("Multi-node multi-GPU not supported yet.")
+                # Single-node multi-GPU (parallel_forward)
                 """
                     N.B.: Tables can be sorted but don't necessarily come in order.
                 """
                 T = len(self.ln_emb)
-                self.device_indices = ext_dist.get_device_indices_for_tables(T, sorted(self.ln_emb), ndevices)
+                self.device_indices = ext_dist.get_device_indices_for_tables(T, sorted(self.ln_emb), ndevices, balancing_type=self.emb_load_balancing)
 
             # quantization
             self.quantize_emb = False
@@ -603,8 +607,8 @@ class DLRM_Net(nn.Module):
 
             dense_x = dense_x[ext_dist.get_my_slice(batch_size)]
             if not self.batched_emb:
-                lS_o = lS_o[self.local_emb_slice]
-                lS_i = lS_i[self.local_emb_slice]
+                lS_o = [lS_o[t] for t in self.local_emb_indices]
+                lS_i = [lS_i[t] for t in self.local_emb_indices]
 
                 if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
                     sys.exit(
@@ -708,7 +712,8 @@ class DLRM_Net(nn.Module):
         tmp_i = []
         # TODO: Fix for multi-node multi-GPU
         if ext_dist.my_size > 1: # Distributed training
-            for _, tmp in enumerate(tmp_list[self.local_emb_slice]):
+            local_tmp_list = [tmp_list[t] for t in self.local_emb_indices]
+            for _, tmp in enumerate(local_tmp_list):
                 o = tmp[1]
                 i = tmp[2]
                 if not tmp_o:
@@ -1255,7 +1260,7 @@ def run():
         torch.cuda.manual_seed_all(args.numpy_rand_seed)
         torch.backends.cudnn.deterministic = True
         if ext_dist.my_size > 1:
-            ngpus = 1
+            ngpus = 1 # TODO: Fix for multi-node multi-GPU
             device = torch.device("cuda", ext_dist.my_local_rank)
         else:
             ngpus = torch.cuda.device_count()
@@ -1671,9 +1676,7 @@ def run():
     writer = SummaryWriter(tb_file)
 
     ext_dist.barrier()
-    with torch.autograd.profiler.profile(
-        args.enable_profiling, use_cuda=use_gpu, use_kineto=True, record_shapes=False
-    ) as prof:
+    with torch.autograd.profiler.profile(args.enable_profiling, use_cuda=use_gpu, use_kineto=True) as prof:
         if not args.inference_only:
             k = 0
             total_time_begin = 0
