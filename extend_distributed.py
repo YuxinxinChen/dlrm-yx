@@ -505,9 +505,10 @@ class All2All_Wait(Function):
                 * a2a_info.emb_dim
             )
             outputs = output[0].split(table_split_lengths)
-            outputs = tuple(
-                [out.view([a2a_info.local_batch_num, -1]) for out in outputs]
-            )
+            if a2a_info.batched_emb:
+                outputs = [out.view([a2a_info.local_batch_num, -1, a2a_info.emb_dim]) for out in outputs]
+            else:
+                outputs = [out.view([a2a_info.local_batch_num, -1]) for out in outputs]
             return outputs
 
     @staticmethod

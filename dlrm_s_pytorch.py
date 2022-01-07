@@ -535,9 +535,6 @@ class DLRM_Net(nn.Module):
 
     def interact_features(self, x, ly):
         (batch_size, d) = x.shape
-        if self.batched_emb: # 2D [B, T*D] -> 3D [B, T, D] after All2All
-            D = self.emb_l[0].D
-            ly = [l.view(batch_size, -1, D) for l in ly]
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
             if self.batched_emb:
@@ -547,24 +544,29 @@ class DLRM_Net(nn.Module):
             # perform a dot product
             Z = torch.bmm(T, torch.transpose(T, 1, 2))
             # append dense feature with the interactions (into a row vector)
+            # ====================
             # approach 1: all
             # Zflat = Z.view((batch_size, -1))
+            # ====================
             # approach 2: unique
             _, ni, nj = Z.shape
-            # approach 1: tril_indices
-            # offset = 0 if self.arch_interaction_itself else -1
-            # li, lj = torch.tril_indices(ni, nj, offset=offset)
-            # approach 2: custom
-            offset = 1 if self.arch_interaction_itself else 0
-            li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
-            lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
+            offset = 0 if self.arch_interaction_itself else -1
+            #      ---------------
+            #      approach 1: tril_indices
+            li, lj = torch.tril_indices(ni, nj, offset=offset)
+            #      ---------------
+            #      approach 2: custom
+            # li = torch.tensor([i for i in range(ni) for _ in range(i + 1 + offset)])
+            # lj = torch.tensor([j for i in range(nj) for j in range(i + 1 + offset)])
+            #      ---------------
             Zflat = Z[:, li, lj]
+            # ====================
             # concatenate dense features and interactions
             R = torch.cat([x] + [Zflat], dim=1)
         elif self.arch_interaction_op == "cat":
             # concatenation features (into a row vector)
             if self.batched_emb:
-                R = torch.cat((x.view(batch_size, 1, d), ly), dim=1)
+                R = torch.cat([x.view(batch_size, 1, d)] + ly, dim=1)
             else:
                 R = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
         else:
@@ -634,9 +636,7 @@ class DLRM_Net(nn.Module):
 
         with record_function("module::forward_pass::bottom_mlp"):
             x = self.apply_mlp(dense_x, self.bot_l)
-
             ly = a2a_req.wait()
-            ly = list(ly)
 
         # interactions
         with record_function("module::forward_pass::interaction"):
@@ -751,7 +751,6 @@ class DLRM_Net(nn.Module):
         with torch.profiler.record_function("module::forward_pass::prologue"):
             # WARNING: # of devices must be >= batch size in parallel_forward call
             batch_size = dense_x.size()[0]
-            B = batch_size
             T = len(self.ln_emb) if self.batched_emb else len(self.emb_l)
             ndevices = min(self.ndevices, batch_size, T)
             device_ids = range(ndevices)
@@ -1676,10 +1675,9 @@ def run():
     writer = SummaryWriter(tb_file)
 
     ext_dist.barrier()
-    with torch.autograd.profiler.profile(args.enable_profiling, use_cuda=use_gpu, use_kineto=True) as prof:
+    with torch.autograd.profiler.profile(args.enable_profiling, use_cuda=use_gpu, use_kineto=True, record_shapes=True) as prof:
         if not args.inference_only:
             k = 0
-            total_time_begin = 0
             while k < args.nepochs:
                 if args.mlperf_logging:
                     mlperf_logger.barrier()
@@ -2102,7 +2100,6 @@ def run():
         dlrm_pytorch_onnx = onnx.load("dlrm_s_pytorch.onnx")
         # check the onnx model
         onnx.checker.check_model(dlrm_pytorch_onnx)
-    total_time_end = time_wrap(use_gpu)
 
 
 if __name__ == "__main__":
