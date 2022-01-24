@@ -83,7 +83,8 @@ def get_device_indices_for_tables(T, Es, ndevices, balancing_type="naive_chunk")
     elif balancing_type == "naive_mod":
         return [(x % ndevices) for x in Es]
     elif balancing_type == "naive_chunk":
-        _, splits = get_split_lengths(T)
+        l, splits = get_split_lengths(T)
+        splits = [l] * ndevices if splits is None else splits
         table_device_indices = []
         for idx, s in enumerate(splits):
             table_device_indices.extend([idx] * s)

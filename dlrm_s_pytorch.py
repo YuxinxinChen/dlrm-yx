@@ -1675,7 +1675,7 @@ def run():
     writer = SummaryWriter(tb_file)
 
     ext_dist.barrier()
-    with torch.autograd.profiler.profile(args.enable_profiling, use_cuda=use_gpu, use_kineto=True, record_shapes=True) as prof:
+    with torch.autograd.profiler.profile(args.enable_profiling, use_cuda=use_gpu, use_kineto=True, record_shapes=False) as prof:
         if not args.inference_only:
             k = 0
             while k < args.nepochs:

@@ -718,18 +718,21 @@ class RandomDataset(Dataset):
 
                     self.file = open(data_file, 'rb')
                 else:
-                    for b in range(nbatches):
-                        fname = data_file + '_{}.hdf5'.format(b)
-                        X = torch.log(lX[b].type(torch.float32) + 1)
-                        lS_o = torch.stack(lS_offsets[b])
-                        lS_i = torch.stack(lS_indices[b])
-                        y = lT[b].view(-1, 1)
+                    import extend_distributed as ext_dist
+                    # Only rank 0 writes to avoid contention
+                    if ext_dist.my_size <= 1 or ext_dist.my_local_rank == 0:
+                        for b in range(nbatches):
+                            fname = data_file + '_{}.hdf5'.format(b)
+                            X = torch.log(lX[b].type(torch.float32) + 1)
+                            lS_o = torch.stack(lS_offsets[b])
+                            lS_i = torch.stack(lS_indices[b])
+                            y = lT[b].view(-1, 1)
 
-                        with h5py.File(fname, 'w') as hf:
-                            _ = hf.create_dataset('X', data=X, shape=X.shape)
-                            _ = hf.create_dataset('lS_o', data=lS_o, shape=lS_o.shape)
-                            _ = hf.create_dataset('lS_i', data=lS_i, shape=lS_i.shape)
-                            _ = hf.create_dataset('y', data=y, shape=y.shape)
+                            with h5py.File(fname, 'w') as hf:
+                                _ = hf.create_dataset('X', data=X, shape=X.shape)
+                                _ = hf.create_dataset('lS_o', data=lS_o, shape=lS_o.shape)
+                                _ = hf.create_dataset('lS_i', data=lS_i, shape=lS_i.shape)
+                                _ = hf.create_dataset('y', data=y, shape=y.shape)
 
     def reset_numpy_seed(self, numpy_rand_seed):
         np.random.seed(numpy_rand_seed)
