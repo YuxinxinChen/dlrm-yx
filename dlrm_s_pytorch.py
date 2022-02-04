@@ -119,7 +119,6 @@ core.GlobalInit(
         "--pytorch_execution_graph_observer_iter_label=## BENCHMARK ##",
     ]
 )
-import GPUtil
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
@@ -149,7 +148,7 @@ def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, ndevices=1):
         return dlrm(X.to(device), lS_o, lS_i)
 
 
-def loss_fn_wrap(Z, T, use_gpu, device):
+def loss_fn_wrap(Z, T, device):
     with record_function("DLRM loss compute"):
         if args.loss_function == "mse" or args.loss_function == "bce":
             return dlrm.loss_fn(Z, T.to(device))
@@ -389,7 +388,7 @@ class DLRM_Net(nn.Module):
 
             if ndevices <= 1:
                 if ext_dist.my_size > 1: # Multi-node (multi-process) single-GPU (distributed_forward), otherwise single-node
-                    n_emb = len(ln_emb)
+                    n_emb = len(self.ln_emb)
                     if n_emb < ext_dist.my_size:
                         sys.exit(
                             "only (%d) sparse features for (%d) devices, table partitions will fail"
@@ -401,9 +400,9 @@ class DLRM_Net(nn.Module):
                     self.n_local_emb = self.n_emb_per_rank[ext_dist.my_rank]
                     self.local_emb_indices = ext_dist.get_my_emb_indices_from_device_indices(self.device_indices) # Replace the old self.local_emb_slice with this (list)
                 if batched_emb:
-                    self.emb_l, w_list = self.create_emb_batched(m_spa, ln_emb, weighted_pooling=weighted_pooling)
+                    self.emb_l, w_list = self.create_emb_batched(m_spa, self.ln_emb, weighted_pooling=weighted_pooling)
                 else:
-                    self.emb_l, w_list = self.create_emb(m_spa, ln_emb, weighted_pooling=weighted_pooling)
+                    self.emb_l, w_list = self.create_emb(m_spa, self.ln_emb, weighted_pooling=weighted_pooling)
                 if self.weighted_pooling == "learned":
                     self.v_W_l = nn.ParameterList()
                     for w in w_list:
@@ -618,7 +617,8 @@ class DLRM_Net(nn.Module):
                     )
 
         # embeddings
-        with record_function("module::forward_pass::embedding_lookup"):
+        table_sizes = (self.ln_emb[self.local_emb_indices] if ext_dist.my_size > 1 else self.ln_emb).tolist()
+        with torch.profiler.record_function("module::forward_pass::embedding_lookup", '-'.join([str(s) for s in table_sizes])):
             if self.batched_emb:
                 ly = self.apply_emb_batched(lS_o, lS_i)
             else:
@@ -666,7 +666,8 @@ class DLRM_Net(nn.Module):
         # print(x.detach().cpu().numpy())
 
         # process sparse features(using embeddings), resulting in a list of row vectors
-        with torch.profiler.record_function("module::forward_pass::embedding_lookup"):
+        table_sizes = (self.ln_emb[self.local_emb_indices] if ext_dist.my_size > 1 else self.ln_emb).tolist()
+        with torch.profiler.record_function("module::forward_pass::embedding_lookup", '-'.join([str(s) for s in table_sizes])):
             if self.batched_emb:
                 ly = self.apply_emb_batched([lS_o], [lS_i]) # New apply_emb API accepts lists as inputs
             else:
@@ -835,7 +836,8 @@ class DLRM_Net(nn.Module):
             # print(x)
 
         # embeddings
-        with torch.profiler.record_function("module::forward_pass::embedding_lookup"):
+        table_sizes = (self.ln_emb[self.local_emb_indices] if ext_dist.my_size > 1 else self.ln_emb).tolist()
+        with torch.profiler.record_function("module::forward_pass::embedding_lookup", '-'.join([str(s) for s in table_sizes])):
             if self.batched_emb:
                 ly = self.apply_emb_batched(lS_o, lS_i, device_ids=device_ids) # In parallel_forward lS_o and lS_i are already lists
             else:
@@ -1765,7 +1767,7 @@ def run():
                             W = W[ext_dist.get_my_slice(mbs)]
 
                         # loss
-                        E = loss_fn_wrap(Z, T, use_gpu, device)
+                        E = loss_fn_wrap(Z, T, device)
 
                         # compute loss and accuracy
                         L = E.detach().cpu().numpy()  # numpy array
