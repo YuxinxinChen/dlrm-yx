@@ -976,12 +976,12 @@ class ProcessedDataset(Dataset):
             lS_i = self.lS_indices[index % self.nbatches]
             T = self.lT[index % self.nbatches]
 
-            if self.batched_emb:
-                indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
-                E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
-                offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]])], dim=0).int() # TODO: fix this
-                lS_i = indices
-                lS_o = offsets
+            #if self.batched_emb:
+            #    indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
+            #    E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
+            #    offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]])], dim=0).int() # TODO: fix this
+            #    lS_i = indices
+            #    lS_o = offsets
 
             return X, lS_o, lS_i, T
 

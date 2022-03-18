@@ -179,6 +179,10 @@ def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, ndevices=1):
                 )
             X = X.to(device)
 
+    ################################
+    a2a_req = ext_dist.alltoall([torch.zeros(10, 10, 16).cuda()], [10, 10, 10, 10], True)
+    tmp = a2a_req.wait()
+    ################################
     with record_function("DLRM forward"):
         return dlrm(X, lS_o, lS_i)
 
@@ -814,6 +818,14 @@ class DLRM_Net(nn.Module):
         """
             N.B.: We only consider reordering data for BATCHED embedding lookup for now.
         """
+        lS_o = [lS_o[i] for i in self.local_emb_indices]
+        lS_i = [lS_i[i] for i in self.local_emb_indices]
+        E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
+        lS_i = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
+        lS_o = torch.cat([torch.tensor([0])] + [x[1:] + y for x, y in zip(lS_o, E_offsets[:-1])], dim=0).int()
+        return [lS_o], [lS_i]
+
+
         B = batch_size
         T = len(self.ln_emb) if self.batched_emb or self.fbgemm_emb else len(self.emb_l)
         #L = int(lS_i.shape[0] / B / T) # Assuming L is fixed
@@ -1929,8 +1941,14 @@ def run():
                                 % (j, X.size(0))
                             )
                             continue
-
+                        
                         mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
+
+                        ################################
+                        a2a_req = ext_dist.alltoall([torch.zeros(10, 10, 16).cuda()], [10, 10, 10, 10], True)
+                        tmp = a2a_req.wait()
+                        ################################
+
 
                         # forward pass
                         Z = dlrm_wrap(
@@ -1962,6 +1980,10 @@ def run():
                         # mbs = T.shape[0]  # = args.mini_batch_size except maybe for last
                         # A = np.sum((np.round(S, 0) == T).astype(np.uint8))
                         # A_shifted = np.sum((np.round(S_shifted, 0) == T).astype(np.uint8))
+                        ################################
+                        a2a_req = ext_dist.alltoall([torch.zeros(10, 10, 16).cuda()], [10, 10, 10, 10], True)
+                        tmp = a2a_req.wait()
+                        ################################
 
                         with record_function("DLRM backward"):
                             # scaled error gradient propagation
