@@ -19,6 +19,7 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # others
+import os
 from os import path
 import sys
 import bisect
@@ -456,7 +457,7 @@ def make_criteo_data_and_loaders(args, offset_to_length_converter=False):
                 counts_file=counts_file,
                 batch_size=args.mini_batch_size,
                 max_ind_range=args.max_ind_range,
-                batched_emb=args.batched_emb
+                batched_or_fbgemm_emb=args.batched_emb or args.fbgemm_emb
             )
 
             mlperf_logger.log_event(key=mlperf_logger.constants.TRAIN_SAMPLES,
@@ -479,7 +480,7 @@ def make_criteo_data_and_loaders(args, offset_to_length_converter=False):
                 counts_file=counts_file,
                 batch_size=args.test_mini_batch_size,
                 max_ind_range=args.max_ind_range,
-                batched_emb=args.batched_emb
+                batched_or_fbgemm_emb=args.batched_emb or args.fbgemm_emb
             )
 
             mlperf_logger.log_event(key=mlperf_logger.constants.EVAL_SAMPLES,
@@ -602,7 +603,7 @@ class RandomDataset(Dataset):
             mini_batch_size,
             num_indices_per_lookup,
             num_indices_per_lookup_fixed,
-            batched_emb,
+            batched_or_fbgemm_emb,
             num_targets=1,
             round_targets=False,
             data_generation="random",
@@ -635,7 +636,7 @@ class RandomDataset(Dataset):
         self.mini_batch_size = mini_batch_size
         self.num_indices_per_lookup = num_indices_per_lookup
         self.num_indices_per_lookup_fixed = num_indices_per_lookup_fixed
-        self.batched_emb = batched_emb
+        self.batched_or_fbgemm_emb = batched_or_fbgemm_emb
         self.num_targets = num_targets
         self.round_targets = round_targets
         self.data_generation = data_generation
@@ -744,7 +745,7 @@ class RandomDataset(Dataset):
         lS_i = indices.clone().detach().type(torch.long).reshape(self.mini_batch_size, -1, self.num_indices_per_lookup).permute(1, 0, 2).reshape(-1, self.mini_batch_size * self.num_indices_per_lookup) # e.g. (2048, 8 * 100) -> (8, 2048 * 100)
         T_batch = T.clone().detach().type(torch.float32).view(-1, 1)
 
-        if self.batched_emb:
+        if self.batched_or_fbgemm_emb:
             indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
             E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
             offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]])], dim=0).int() # TODO: fix this
@@ -781,7 +782,7 @@ class RandomDataset(Dataset):
                         lS_i = torch.tensor(np.array(hf['lS_i']))
                         y = torch.tensor(np.array(hf['y']))
 
-                    if self.batched_emb:
+                    if self.batched_or_fbgemm_emb:
                         indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
                         E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
                         offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]])], dim=0).int() # TODO: fix this
@@ -830,7 +831,7 @@ class RandomDataset(Dataset):
                 # generate a batch of target (probability of a click)
                 T = generate_random_output_batch(n, self.num_targets, self.round_targets)
 
-                if self.batched_emb:
+                if self.batched_or_fbgemm_emb:
                     # lS_i: List of T tensors with size <= B * L, each of which contains concatenated indices segments with variable lengths, as L is never fixed
                     # -> indices (T * B * L)
                     # lS_o: List of T tensors with size (B), each of which contains B offsets with variable difference between each consecutive pair of them, as L is never fixed
@@ -870,6 +871,8 @@ def collate_wrapper_random_length(list_of_tuples):
 def make_random_data_and_loader(args, ln_emb, m_den,
     offset_to_length_converter=False,
 ):
+    if not path.exists(args.processed_data_file):
+        os.makedirs(args.processed_data_file)
 
     train_data = RandomDataset(
         m_den,
@@ -879,7 +882,7 @@ def make_random_data_and_loader(args, ln_emb, m_den,
         args.mini_batch_size,
         args.num_indices_per_lookup,
         args.num_indices_per_lookup_fixed,
-        args.batched_emb,
+        args.batched_emb or args.fbgemm_emb,
         1,  # num_targets
         args.round_targets,
         args.data_generation,
@@ -904,7 +907,7 @@ def make_random_data_and_loader(args, ln_emb, m_den,
         args.mini_batch_size,
         args.num_indices_per_lookup,
         args.num_indices_per_lookup_fixed,
-        args.batched_emb,
+        args.batched_emb or args.fbgemm_emb,
         1,  # num_targets
         args.round_targets,
         args.data_generation,
@@ -923,6 +926,85 @@ def make_random_data_and_loader(args, ln_emb, m_den,
     collate_wrapper_random = collate_wrapper_random_offset
     if offset_to_length_converter:
         collate_wrapper_random = collate_wrapper_random_length
+
+    train_loader = torch.utils.data.DataLoader(
+        train_data,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_wrapper_random,
+        pin_memory=args.pin_memory,
+        drop_last=False,  # True
+    )
+
+    test_loader = torch.utils.data.DataLoader(
+        test_data,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_wrapper_random,
+        pin_memory=False,
+        drop_last=False,  # True
+    )
+    return train_data, train_loader, test_data, test_loader
+
+
+class ProcessedDataset(Dataset):
+    def __init__(
+            self,
+            processed_data_file,
+            total_num_batches,
+            batched_or_fbgemm_emb
+    ):
+        self.total_num_batches = total_num_batches
+        self.batched_or_fbgemm_emb = batched_or_fbgemm_emb
+        data = torch.load(os.path.join(processed_data_file, "data.pt"))
+        self.nbatches = data["nbatches"]
+        self.lX = data["lX"]
+        self.lS_offsets = data["lS_offsets"]
+        self.lS_indices = data["lS_indices"]
+        self.lT = data["lT"]
+
+    def __getitem__(self, index):
+        with torch.autograd.profiler.record_function("module::get_batch_data"):
+            if isinstance(index, slice):
+                return [
+                    self[idx] for idx in range(
+                        index.start or 0, index.stop or len(self), index.step or 1
+                    )
+                ]
+
+            X = self.lX[index % self.nbatches]
+            lS_o = self.lS_offsets[index % self.nbatches]
+            lS_i = self.lS_indices[index % self.nbatches]
+            T = self.lT[index % self.nbatches]
+
+            # if self.batched_emb:
+            #     indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
+            #     E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
+            #     offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]])], dim=0).int() # TODO: fix this
+            #     lS_i = indices
+            #     lS_o = offsets
+
+            return X, lS_o, lS_i, T
+
+    def __len__(self):
+        return self.total_num_batches
+
+def make_processed_data_and_loader(args):
+    train_data = ProcessedDataset(
+        args.processed_data_file,
+        args.num_batches,
+        args.batched_emb or args.fbgemm_emb
+    )
+
+    test_data = ProcessedDataset(
+        args.processed_data_file,
+        args.num_batches,
+        args.batched_emb or args.fbgemm_emb
+    )
+
+    collate_wrapper_random = collate_wrapper_random_offset
 
     train_loader = torch.utils.data.DataLoader(
         train_data,

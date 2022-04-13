@@ -66,7 +66,7 @@ class DataLoader:
 
 
 def _transform_features(
-        x_int_batch, x_cat_batch, y_batch, max_ind_range, flag_input_torch_tensor=False, batched_emb=False
+        x_int_batch, x_cat_batch, y_batch, max_ind_range, flag_input_torch_tensor=False, batched_or_fbgemm_emb=False
 ):
     if max_ind_range > 0:
         x_cat_batch = x_cat_batch % max_ind_range
@@ -85,7 +85,7 @@ def _transform_features(
     lS_o = torch.arange(batch_size).reshape(1, -1).repeat(feature_count, 1)
     lS_i = x_cat_batch.t()
 
-    if batched_emb:
+    if batched_or_fbgemm_emb:
         indices = torch.cat([x.view(-1) for x in lS_i], dim=0).int()
         E_offsets = [0] + np.cumsum([x.view(-1).shape[0] for x in lS_i]).tolist()
         offsets = torch.cat([x + y for x, y in zip(lS_o, E_offsets[:-1])] + [torch.tensor([E_offsets[-1]])], dim=0).int() # TODO: fix this
@@ -206,7 +206,7 @@ class CriteoBinDataset(Dataset):
     """Binary version of criteo dataset."""
 
     def __init__(self, data_file, counts_file,
-                 batch_size=1, max_ind_range=-1, bytes_per_feature=4, batched_emb=False):
+                 batch_size=1, max_ind_range=-1, bytes_per_feature=4, batched_or_fbgemm_emb=False):
         # dataset
         self.tar_fea = 1   # single target
         self.den_fea = 13  # 13 dense  features
@@ -230,7 +230,7 @@ class CriteoBinDataset(Dataset):
         self.m_den = 13
 
         # using table batched embedding lookup
-        self.batched_emb = batched_emb
+        self.batched_or_fbgemm_emb = batched_or_fbgemm_emb
 
     def __len__(self):
         return self.num_entries
@@ -246,7 +246,7 @@ class CriteoBinDataset(Dataset):
                                    y_batch=tensor[:, 0],
                                    max_ind_range=self.max_ind_range,
                                    flag_input_torch_tensor=True,
-                                   batched_emb=self.batched_emb)
+                                   batched_or_fbgemm_emb=self.batched_or_fbgemm_emb)
 
     def __del__(self):
         self.file.close()

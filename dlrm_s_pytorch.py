@@ -54,6 +54,7 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import argparse
+import os
 
 # miscellaneous
 import builtins
@@ -69,6 +70,9 @@ import warnings
 
 # data generation
 import dlrm_data_pytorch as dp
+
+# Sharders
+import sharders
 
 # For distributed run
 import extend_distributed as ext_dist
@@ -110,15 +114,19 @@ from torchviz import make_dot
 
 from torch.optim.lr_scheduler import _LRScheduler
 
-import graph_observer
-from caffe2.python import core
-core.GlobalInit(
-    [
-        "python",
-        "--pytorch_enable_execution_graph_observer=true",
-        "--pytorch_execution_graph_observer_iter_label=## BENCHMARK ##",
-    ]
-)
+# try:
+#     import graph_observer
+#     from caffe2.python import core
+#     core.GlobalInit(
+#         [
+#             "python",
+#             "--pytorch_enable_execution_graph_observer=true",
+#             "--pytorch_execution_graph_observer_iter_label=## BENCHMARK ##",
+#         ]
+#     )
+#     import GPUtil
+# except:
+#     print("graph_observer and GPUitl NOT imported")
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
@@ -130,11 +138,35 @@ def time_wrap(use_gpu):
 
 
 def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, ndevices=1):
-    with record_function("DLRM forward"):
-        if use_gpu:  # .cuda()
-            # lS_i can be either a list of tensors or a stacked tensor.
-            # Handle each case below:
-            if ndevices == 1:
+    if use_gpu:
+        # lS_i can be either a list of tensors or a stacked tensor.
+        # Handle each case below:
+        with record_function("Data Moving"):
+            if ndevices == 1: # Assuming each rank has only one GPU. TODO: Support single-rank multi-GPU.
+                if ext_dist.my_size > 1: # Multi-GPU
+                    batch_size = X.size()[0]
+                    # WARNING: # of ranks must be <= batch size in distributed_forward call
+                    if batch_size < ext_dist.my_size:
+                        sys.exit(
+                            "ERROR: batch_size (%d) must be larger than number of ranks (%d)"
+                            % (batch_size, ext_dist.my_size)
+                        )
+                    if batch_size % ext_dist.my_size != 0:
+                        sys.exit(
+                            "ERROR: batch_size %d can not split across %d ranks evenly"
+                            % (batch_size, ext_dist.my_size)
+                        )
+
+                    X = X[ext_dist.get_my_slice(batch_size)]
+                    if not dlrm.batched_emb and not dlrm.fbgemm_emb:
+                        lS_o = [lS_o[i] for i in dlrm.local_emb_indices]
+                        lS_i = [lS_i[i] for i in dlrm.local_emb_indices]
+
+                        if (len(dlrm.emb_l) != len(lS_o)) or (len(dlrm.emb_l) != len(lS_i)):
+                            sys.exit(
+                                "ERROR: corrupted model input detected in distributed_forward call"
+                            )
+
                 lS_i = (
                     [S_i.to(device) for S_i in lS_i]
                     if isinstance(lS_i, list)
@@ -145,7 +177,10 @@ def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, ndevices=1):
                     if isinstance(lS_o, list)
                     else lS_o.to(device)
                 )
-        return dlrm(X.to(device), lS_o, lS_i)
+            X = X.to(device)
+
+    with record_function("DLRM forward"):
+        return dlrm(X, lS_o, lS_i)
 
 
 def loss_fn_wrap(Z, T, device):
@@ -245,7 +280,7 @@ class DLRM_Net(nn.Module):
         # approach 2: use Sequential container to wrap all layers
         return torch.nn.Sequential(*layers)
 
-    def create_emb(self, m, ln, weighted_pooling=None):
+    def create_emb(self, lm, ln, weighted_pooling=None):
         emb_l = nn.ModuleList()
         v_W_l = []
         for i in range(0, ln.size):
@@ -253,6 +288,11 @@ class DLRM_Net(nn.Module):
                 if i not in self.local_emb_indices:
                     continue
             n = ln[i]
+
+            if self.load_processed:
+                m = lm[i]
+            else:
+                m = lm
 
             # construct embedding operator
             if self.qr_flag and n > self.qr_threshold:
@@ -309,6 +349,38 @@ class DLRM_Net(nn.Module):
             stochastic_rounding=False,
         ), [None] * T
 
+    def create_emb_fbgemm(self, Ds, Es, weighted_pooling=None):
+        assert weighted_pooling is None, "Weighted pooling not supported yet!" # TODO: Fix this.
+        from fbgemm_gpu import split_table_batched_embeddings_ops
+        from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType, SparseType
+        T = len(Es)
+
+        if ext_dist.my_size > 1:
+            emb_indices = [i for i in range(T) if i in self.local_emb_indices]
+        else:
+            emb_indices = [i for i in range(T)]
+
+        if not self.load_processed:
+            Ds = [Ds] * len(self.ln_emb)
+
+        return split_table_batched_embeddings_ops.SplitTableBatchedEmbeddingBagsCodegen(
+            [
+                (
+                    Es[i],
+                    Ds[i],
+                    split_table_batched_embeddings_ops.EmbeddingLocation.DEVICE,
+                    split_table_batched_embeddings_ops.ComputeDevice.CUDA,
+                )
+                for i in emb_indices
+            ],
+            optimizer=OptimType.EXACT_SGD,
+            cache_algorithm=split_table_batched_embeddings_ops.CacheAlgorithm.LFU,
+            cache_reserved_memory=8.0,
+            eps=0.01,
+            device=None,
+            weights_precision=SparseType.FP16,
+        ), [None] * T
+
     def __init__(
         self,
         m_spa=None,
@@ -331,7 +403,10 @@ class DLRM_Net(nn.Module):
         weighted_pooling=None,
         loss_function="bce",
         batched_emb=False,
-        emb_load_balancing="naive_chunk"
+        fbgemm_emb=False,
+        load_processed=False,
+        sharder="naive",
+        allocation=None,
     ):
         super(DLRM_Net, self).__init__()
 
@@ -373,34 +448,44 @@ class DLRM_Net(nn.Module):
             if self.md_flag:
                 self.md_threshold = md_threshold
 
-            # Create operators
-            # Custom Model-Data Parallel
-            # the mlps are replicated and use data parallelism, while
-            # the embeddings are distributed and use model parallelism
-            self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
-            self.top_l = self.create_mlp(ln_top, sigmoid_top)
-
-            # use table batched embedding
+            # use table batched embedding or fbgemm embedding
             self.batched_emb = batched_emb
+            self.fbgemm_emb = fbgemm_emb
+            self.load_processed = load_processed
 
-            # load balancing type
-            self.emb_load_balancing = emb_load_balancing
+            # Sharding algorithm
+            self.sharder = sharder
 
+            # If running distributed, get local slice of embedding tables
             if ndevices <= 1:
                 if ext_dist.my_size > 1: # Multi-node (multi-process) single-GPU (distributed_forward), otherwise single-node
-                    n_emb = len(self.ln_emb)
+                    n_emb = len(ln_emb)
                     if n_emb < ext_dist.my_size:
                         sys.exit(
                             "only (%d) sparse features for (%d) devices, table partitions will fail"
                             % (n_emb, ext_dist.my_size)
                         )
-                    T = len(self.ln_emb)
-                    self.device_indices = ext_dist.get_device_indices_for_tables(T, sorted(self.ln_emb), ext_dist.my_size, balancing_type=self.emb_load_balancing)
-                    self.n_emb_per_rank = ext_dist.get_splits_from_device_indices(self.device_indices)
-                    self.n_local_emb = self.n_emb_per_rank[ext_dist.my_rank]
-                    self.local_emb_indices = ext_dist.get_my_emb_indices_from_device_indices(self.device_indices) # Replace the old self.local_emb_slice with this (list)
+                    self.n_global_emb = n_emb
+                    if sharder == "input":
+                        self.device_indices = list(map(int, allocation.split(",")))
+                    else:
+                        self.device_indices = sharders.shard(self.ln_emb, ext_dist.my_size, sharder)
+                    print("Sharding:", self.device_indices)
+
+                    if load_processed:
+                        num_splits = []
+                        for _m_spa in m_spa:
+                            num_splits.append(_m_spa // self.ln_bot[-1])
+                    else:
+                        num_splits = [m_spa // self.ln_bot[-1]] * n_emb
+                    self.n_emb_per_rank = [0] * ext_dist.my_size
+                    for i, num_split in enumerate(num_splits):
+                        self.n_emb_per_rank[self.device_indices[i]] += num_split
+                    self.local_emb_indices = [i for i, j in enumerate(self.device_indices) if j == ext_dist.my_local_rank]
                 if batched_emb:
                     self.emb_l, w_list = self.create_emb_batched(m_spa, self.ln_emb, weighted_pooling=weighted_pooling)
+                elif fbgemm_emb:
+                    self.emb_l, w_list = self.create_emb_fbgemm(m_spa, self.ln_emb, weighted_pooling=weighted_pooling)
                 else:
                     self.emb_l, w_list = self.create_emb(m_spa, self.ln_emb, weighted_pooling=weighted_pooling)
                 if self.weighted_pooling == "learned":
@@ -416,8 +501,15 @@ class DLRM_Net(nn.Module):
                 """
                     N.B.: Tables can be sorted but don't necessarily come in order.
                 """
-                T = len(self.ln_emb)
-                self.device_indices = ext_dist.get_device_indices_for_tables(T, sorted(self.ln_emb), ndevices, balancing_type=self.emb_load_balancing)
+                self.device_indices = sharders.shard(self.ln_emb, ndevices, sharder)
+                print("Sharding:", self.device_indices)
+
+            # Create operators
+            # Custom Model-Data Parallel
+            # the mlps are replicated and use data parallelism, while
+            # the embeddings are distributed and use model parallelism
+            self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
+            self.top_l = self.create_mlp(ln_top, sigmoid_top)
 
             # quantization
             self.quantize_emb = False
@@ -500,18 +592,34 @@ class DLRM_Net(nn.Module):
                 )
                 ly.append(V)
 
+        _ly = []
+        for y in ly:
+            if y.shape[1] == self.ln_bot[-1]:
+                _ly.append(y)
+            else:
+                _ly.extend(y.split(int(self.ln_bot[-1]), dim=1))
+        ly = _ly
         # print(ly)
         return ly
 
     def apply_emb_batched(self, lS_o, lS_i, device_ids=None):
-        if device_ids is not None:
-            inputs = [(indices, offset) for offset, indices in zip(lS_o, lS_i)]
-            ly = parallel_apply(self.emb_l, inputs, None, device_ids)
-        else:
-            ly = []
-            for E, offset, indices in zip(self.emb_l, lS_o, lS_i):
-                ly.append(E(indices, offset))
+        ly = parallel_apply(self.emb_l, tuple(zip(lS_i, lS_o)), None, device_ids)
         return ly
+
+    def apply_emb_fbgemm(self, lS_o, lS_i, device_ids=None):
+        ly = parallel_apply(self.emb_l, tuple(zip(lS_i, lS_o)), None, device_ids)
+        B, _ = ly[0].shape
+        D = self.ln_bot[-1]
+        ly = [y.reshape(B, -1, D) for y in ly]
+        return ly
+
+        # if device_ids is not None:
+        #     inputs = tuple(zip(lS_i, lS_o))
+        #     ly = parallel_apply(self.emb_l, inputs, None, device_ids)
+        # else:
+        #     ly = []
+        #     for E, offset, indices in zip(self.emb_l, lS_o, lS_i):
+        #         ly.append(E(indices, offset))
 
     #  using quantizing functions from caffe2/aten/src/ATen/native/quantized/cpu
     def quantize_embedding(self, bits):
@@ -534,9 +642,12 @@ class DLRM_Net(nn.Module):
 
     def interact_features(self, x, ly):
         (batch_size, d) = x.shape
+        if self.batched_emb or self.fbgemm_emb: # 2D [B, T*D] -> 3D [B, T, D] after All2All
+            D = self.ln_bot[-1]
+            ly = [l.view(batch_size, -1, D) for l in ly]
         if self.arch_interaction_op == "dot":
             # concatenate dense and sparse features
-            if self.batched_emb:
+            if self.batched_emb or self.fbgemm_emb:
                 T = torch.cat([x.view(batch_size, 1, d)] + ly, dim=1) # ly is a list of output tensors on various devices from embedding lookup
             else:
                 T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
@@ -564,8 +675,8 @@ class DLRM_Net(nn.Module):
             R = torch.cat([x] + [Zflat], dim=1)
         elif self.arch_interaction_op == "cat":
             # concatenation features (into a row vector)
-            if self.batched_emb:
-                R = torch.cat([x.view(batch_size, 1, d)] + ly, dim=1)
+            if self.batched_emb or self.fbgemm_emb:
+                R = torch.cat(([x.view(batch_size, 1, d)] + ly), dim=1)
             else:
                 R = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
         else:
@@ -592,35 +703,13 @@ class DLRM_Net(nn.Module):
         if not isinstance(self.emb_l, nn.ModuleList):
             self.emb_l = nn.ModuleList([self.emb_l])
 
-        with torch.profiler.record_function("module::forward_pass::prologue"):
-            batch_size = dense_x.size()[0]
-            # WARNING: # of ranks must be <= batch size in distributed_forward call
-            if batch_size < ext_dist.my_size:
-                sys.exit(
-                    "ERROR: batch_size (%d) must be larger than number of ranks (%d)"
-                    % (batch_size, ext_dist.my_size)
-                )
-            if batch_size % ext_dist.my_size != 0:
-                sys.exit(
-                    "ERROR: batch_size %d can not split across %d ranks evenly"
-                    % (batch_size, ext_dist.my_size)
-                )
-
-            dense_x = dense_x[ext_dist.get_my_slice(batch_size)]
-            if not self.batched_emb:
-                lS_o = [lS_o[t] for t in self.local_emb_indices]
-                lS_i = [lS_i[t] for t in self.local_emb_indices]
-
-                if (len(self.emb_l) != len(lS_o)) or (len(self.emb_l) != len(lS_i)):
-                    sys.exit(
-                        "ERROR: corrupted model input detected in distributed_forward call"
-                    )
-
         # embeddings
         table_sizes = (self.ln_emb[self.local_emb_indices] if ext_dist.my_size > 1 else self.ln_emb).tolist()
-        with torch.profiler.record_function("module::forward_pass::embedding_lookup", '-'.join([str(s) for s in table_sizes])):
+        with record_function("module::forward_pass::embedding_lookup", '-'.join([str(s) for s in table_sizes])):
             if self.batched_emb:
                 ly = self.apply_emb_batched(lS_o, lS_i)
+            elif self.fbgemm_emb:
+                ly = self.apply_emb_fbgemm(lS_o, lS_i)
             else:
                 ly = self.apply_emb(lS_o, lS_i)
 
@@ -632,11 +721,13 @@ class DLRM_Net(nn.Module):
             if len(self.emb_l) != len(ly):
                 sys.exit("ERROR: corrupted intermediate result in distributed_forward call")
 
-            a2a_req = ext_dist.alltoall(ly, self.n_emb_per_rank, self.batched_emb)
+            a2a_req = ext_dist.alltoall(ly, self.n_emb_per_rank, self.batched_emb or self.fbgemm_emb)
 
         with record_function("module::forward_pass::bottom_mlp"):
             x = self.apply_mlp(dense_x, self.bot_l)
+
             ly = a2a_req.wait()
+            ly = list(ly)
 
         # interactions
         with record_function("module::forward_pass::interaction"):
@@ -659,7 +750,7 @@ class DLRM_Net(nn.Module):
             self.emb_l = nn.ModuleList([self.emb_l])
 
         # process dense features (using bottom mlp), resulting in a row vector
-        with torch.profiler.record_function("module::forward_pass::bottom_mlp"):
+        with record_function("module::forward_pass::bottom_mlp"):
             x = self.apply_mlp(dense_x, self.bot_l)
         # debug prints
         # print("intermediate")
@@ -667,21 +758,23 @@ class DLRM_Net(nn.Module):
 
         # process sparse features(using embeddings), resulting in a list of row vectors
         table_sizes = (self.ln_emb[self.local_emb_indices] if ext_dist.my_size > 1 else self.ln_emb).tolist()
-        with torch.profiler.record_function("module::forward_pass::embedding_lookup", '-'.join([str(s) for s in table_sizes])):
+        with record_function("module::forward_pass::embedding_lookup", '-'.join([str(s) for s in table_sizes])):
             if self.batched_emb:
                 ly = self.apply_emb_batched([lS_o], [lS_i]) # New apply_emb API accepts lists as inputs
+            elif self.fbgemm_emb:
+                ly = self.apply_emb_fbgemm([lS_o], [lS_i])
             else:
                 ly = self.apply_emb(lS_o, lS_i)
         # for y in ly:
         #     print(y.detach().cpu().numpy())
 
         # interact features (dense and sparse)
-        with torch.profiler.record_function("module::forward_pass::interaction"):
+        with record_function("module::forward_pass::interaction"):
             z = self.interact_features(x, ly)
         # print(z.detach().cpu().numpy())
 
         # obtain probability of a click (using top mlp)
-        with torch.profiler.record_function("module::forward_pass::top_mlp"):
+        with record_function("module::forward_pass::top_mlp"):
             p = self.apply_mlp(z, self.top_l)
 
         # clamp output if needed
@@ -697,7 +790,7 @@ class DLRM_Net(nn.Module):
             N.B.: We only consider reordering data for BATCHED embedding lookup for now.
         """
         B = batch_size
-        T = len(self.ln_emb) if self.batched_emb else len(self.emb_l)
+        T = len(self.ln_emb) if self.batched_emb or self.fbgemm_emb else len(self.emb_l)
         L = int(lS_i.shape[0] / B / T) # Assuming L is fixed
         ndevices = min(self.ndevices, batch_size, T)
         t_list = []
@@ -713,8 +806,7 @@ class DLRM_Net(nn.Module):
         tmp_i = []
         # TODO: Fix for multi-node multi-GPU
         if ext_dist.my_size > 1: # Distributed training
-            local_tmp_list = [tmp_list[t] for t in self.local_emb_indices]
-            for _, tmp in enumerate(local_tmp_list):
+            for _, tmp in enumerate([tmp_list[i] for i in self.local_emb_indices]):
                 o = tmp[1]
                 i = tmp[2]
                 if not tmp_o:
@@ -749,10 +841,10 @@ class DLRM_Net(nn.Module):
 
     def parallel_forward(self, dense_x, lS_o, lS_i):
         ### prepare model (overwrite) ###
-        with torch.profiler.record_function("module::forward_pass::prologue"):
+        with record_function("module::forward_pass::prologue"):
             # WARNING: # of devices must be >= batch size in parallel_forward call
             batch_size = dense_x.size()[0]
-            T = len(self.ln_emb) if self.batched_emb else len(self.emb_l)
+            T = len(self.ln_emb) if self.batched_emb or self.fbgemm_emb else len(self.emb_l)
             ndevices = min(self.ndevices, batch_size, T)
             device_ids = range(ndevices)
             # WARNING: must redistribute the model if mini-batch size changes(this is common
@@ -770,7 +862,7 @@ class DLRM_Net(nn.Module):
                 # distribute embeddings (model parallelism)
                 t_list = []
                 w_list = []
-                if self.batched_emb:
+                if self.batched_emb or self.fbgemm_emb:
                     tmp_t_list = []
                     for _ in range(ndevices):
                         tmp_t_list.append([])
@@ -778,7 +870,10 @@ class DLRM_Net(nn.Module):
                         tmp_t_list[self.device_indices[k]].append(sorted(self.ln_emb)[k])
                     for k, t in enumerate(tmp_t_list):
                         d = torch.device("cuda:" + str(k))
-                        emb, _ = self.create_emb_batched(self.m_spa, t, self.weighted_pooling) # Create batched embdding for tables distributed to each device
+                        if self.batched_emb:
+                            emb, _ = self.create_emb_batched(self.m_spa, t, self.weighted_pooling) # Create batched embdding for tables distributed to each device
+                        else:
+                            emb, _ = self.create_emb_fbgemm(self.m_spa, t, self.weighted_pooling) # Create batched embdding for tables distributed to each device
                         t_list.append(emb.to(d, non_blocking=True))
                     self.emb_l = nn.ModuleList(t_list) # Has length of # devices
                     # TODO: Fix v_W_l
@@ -806,7 +901,7 @@ class DLRM_Net(nn.Module):
             # distribute sparse features (model parallelism)
             t_list = []
             i_list = []
-            if self.batched_emb:
+            if self.batched_emb or self.fbgemm_emb:
                 for k in range(ndevices):
                     d = torch.device("cuda:" + str(self.device_indices[k]))
                     t_list.append(lS_o[k].to(d, non_blocking=True))
@@ -830,16 +925,18 @@ class DLRM_Net(nn.Module):
         # inputs that has been scattered across devices on the first (batch) dimension.
         # The output is a list of tensors scattered across devices according to the
         # distribution of dense_x.
-        with torch.profiler.record_function("module::forward_pass::bottom_mlp"):
+        with record_function("module::forward_pass::bottom_mlp"):
             x = parallel_apply(self.bot_l_replicas, dense_x, None, device_ids)
             # debug prints
             # print(x)
 
         # embeddings
         table_sizes = (self.ln_emb[self.local_emb_indices] if ext_dist.my_size > 1 else self.ln_emb).tolist()
-        with torch.profiler.record_function("module::forward_pass::embedding_lookup", '-'.join([str(s) for s in table_sizes])):
+        with record_function("module::forward_pass::embedding_lookup", '-'.join([str(s) for s in table_sizes])):
             if self.batched_emb:
                 ly = self.apply_emb_batched(lS_o, lS_i, device_ids=device_ids) # In parallel_forward lS_o and lS_i are already lists
+            elif self.fbgemm_emb:
+                ly = self.apply_emb_fbgemm(lS_o, lS_i, device_ids=device_ids) # In parallel_forward lS_o and lS_i are already lists
             else:
                 ly = self.apply_emb(lS_o, lS_i)
             # debug prints
@@ -864,7 +961,7 @@ class DLRM_Net(nn.Module):
             #   list (non-batched) or tensor (batched) of partial output across the batch dimension of table 0, table 1, table 2... # device 0
             #   list (non-batched) or tensor (batched) of partial output across the batch dimension of table 0, table 1, table 2... # device 1
             # ]
-            if self.batched_emb:
+            if self.batched_emb or self.fbgemm_emb:
                 ly = list(map(lambda y: torch.cat(y, dim=1), zip(*t_list))) # e.g., [1024, 4, 64] & [1024, 4, 64] = [1024, 8, 64] per device, tables OUT OF ORDER, e.g. [[0, 2, 3], [1, 4, 5]]
                 device_table_list = [] # Which device processed which tables
                 for _ in range(ndevices):
@@ -879,8 +976,8 @@ class DLRM_Net(nn.Module):
             # print(ly)
 
         # interactions
-        with torch.profiler.record_function("module::forward_pass::interaction"):
-            inputs = [(xx, [yy] if self.batched_emb else yy) for xx, yy in zip(x, ly)]
+        with record_function("module::forward_pass::interaction"):
+            inputs = [(xx, [yy] if self.batched_emb or self.fbgemm_emb else yy) for xx, yy in zip(x, ly)]
             z = parallel_apply([self.interact_features] * ndevices, inputs, None, device_ids)
             # debug prints
             # print(z)
@@ -891,7 +988,7 @@ class DLRM_Net(nn.Module):
         # that by construction are scattered across devices on the first (batch) dim.
         # The output is a list of tensors scattered across devices according to the
         # distribution of z.
-        with torch.profiler.record_function("module::forward_pass::top_mlp"):
+        with record_function("module::forward_pass::top_mlp"):
             p = parallel_apply(self.top_l_replicas, z, None, device_ids)
 
         ### gather the distributed results ###
@@ -960,7 +1057,7 @@ def inference(
             testBatch
         )
         with record_function("DLRM distribute emb data"):
-            if dlrm.batched_emb:
+            if dlrm.batched_emb or dlrm.fbgemm_emb:
                 if ndevices > 1 or ext_dist.my_size > 1:
                     lS_o_test, lS_i_test = dlrm.distribute_batched_emb_data(X_test.size()[0], lS_o_test, lS_i_test)
 
@@ -1086,6 +1183,14 @@ def run():
     parser = argparse.ArgumentParser(
         description="Train Deep Learning Recommendation Model (DLRM)"
     )
+    parser.add_argument("--profile-out-dir", type=str, default="profiles/tmp")
+    # Sharding algorith
+    parser.add_argument("--sharder", type=str, default="greedy")
+    parser.add_argument("--allocation", type=str, default="")
+
+    # Load generated data
+    parser.add_argument("--load-processed", action="store_true", default=False)
+
     # model related parameters
     parser.add_argument("--arch-sparse-feature-size", type=int, default=2)
     parser.add_argument(
@@ -1109,6 +1214,7 @@ def run():
     parser.add_argument("--qr-operation", type=str, default="mult")
     parser.add_argument("--qr-collisions", type=int, default=4)
     parser.add_argument("--batched-emb", action="store_true", default=False)
+    parser.add_argument("--fbgemm-emb", action="store_true", default=False)
     # activations and loss
     parser.add_argument("--activation-function", type=str, default="relu")
     parser.add_argument("--loss-function", type=str, default="mse")  # or bce or wbce
@@ -1257,6 +1363,10 @@ def run():
     if not args.debug_mode:
         ext_dist.init_distributed(local_rank=args.local_rank, use_gpu=use_gpu, backend=args.dist_backend)
 
+    if not os.path.exists(args.profile_out_dir):
+        if ext_dist.my_local_rank == 0:
+            os.makedirs(args.profile_out_dir)
+
     if use_gpu:
         torch.cuda.manual_seed_all(args.numpy_rand_seed)
         torch.backends.cudnn.deterministic = True
@@ -1283,7 +1393,6 @@ def run():
 
     if args.data_generation == "dataset":
         train_data, train_ld, test_data, test_ld = dp.make_criteo_data_and_loaders(args)
-        table_feature_map = {idx: idx for idx in range(len(train_data.counts))}
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
         nbatches_test = len(test_ld)
 
@@ -1304,23 +1413,44 @@ def run():
         ln_bot[0] = m_den
         print("ln_emb: ", ln_emb)
     else:
-        # input and target at random
-        ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
-        m_den = ln_bot[0]
-        train_data, train_ld, test_data, test_ld = dp.make_random_data_and_loader(args, ln_emb, m_den)
-        nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
-        nbatches_test = len(test_ld)
-
-    args.ln_emb = ln_emb.tolist()
+        if args.load_processed:
+            with open(os.path.join(args.processed_data_file, "table_configs.json")) as f:
+                table_configs = json.load(f)
+            ln_emb = [config["row"] for config in table_configs["tables"]] 
+            m_den = ln_bot[0]
+            train_data, train_ld, test_data, test_ld = dp.make_processed_data_and_loader(args)
+            nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
+            nbatches_test = len(test_ld)
+            args.ln_emb = ln_emb
+            print("ln_emb: ", ln_emb)
+        else:
+            # input and target at random
+            ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
+            m_den = ln_bot[0]
+            train_data, train_ld, test_data, test_ld = dp.make_random_data_and_loader(args, ln_emb, m_den)
+            nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
+            nbatches_test = len(test_ld)
+            args.ln_emb = ln_emb.tolist()
     if args.mlperf_logging:
         print("command line args: ", json.dumps(vars(args)))
 
     ### parse command line arguments ###
-    m_spa = args.arch_sparse_feature_size
+    if args.load_processed:
+        m_spa = [config["dim"] for config in table_configs["tables"]] 
+        print("m_spa: ", m_spa)
+    else:
+        m_spa = args.arch_sparse_feature_size
     ln_emb = np.asarray(ln_emb)
-    num_fea = ln_emb.size + 1  # num sparse + num dense features
-
     m_den_out = ln_bot[ln_bot.size - 1]
+    if args.load_processed:
+        # Assume that the interactions happen only for the same dims
+        num_fea = 0
+        for _m_spa in m_spa:
+            num_fea += _m_spa // m_den_out
+        num_fea += 1
+    else:
+        num_fea = ln_emb.size * (m_spa // m_den_out) + 1  # num sparse + num dense features
+
     if args.arch_interaction_op == "dot":
         # approach 1: all
         # num_int = num_fea * num_fea + m_den_out
@@ -1339,6 +1469,12 @@ def run():
         )
     arch_mlp_top_adjusted = str(num_int) + "-" + args.arch_mlp_top
     ln_top = np.fromstring(arch_mlp_top_adjusted, dtype=int, sep="-")
+
+    # Can only specify both batched-emb and fbgemm emb
+    if args.batched_emb and args.fbgemm_emb:
+        sys.exit(
+            "ERROR: Can not have both --batched-emb and --fbgemm-emb"
+        )
 
     # sanity check: feature sizes and mlp dimensions must match
     if m_den != ln_bot[0]:
@@ -1365,13 +1501,14 @@ def run():
                 + str(m_den_out)
             )
     else:
-        if m_spa != m_den_out:
-            sys.exit(
-                "ERROR: arch-sparse-feature-size "
-                + str(m_spa)
-                + " does not match last dim of bottom mlp "
-                + str(m_den_out)
-            )
+        pass # Added split here so we don't need to check
+       # if not args.load_processed and m_spa != m_den_out:
+       #     sys.exit(
+       #         "ERROR: arch-sparse-feature-size "
+       #         + str(m_spa)
+       #         + " does not match last dim of bottom mlp "
+       #         + str(m_den_out)
+       #     )
     if num_int != ln_top[0]:
         sys.exit(
             "ERROR: # of feature interactions "
@@ -1447,8 +1584,9 @@ def run():
     global ndevices
     ndevices = min(ngpus, args.mini_batch_size, num_fea - 1) if use_gpu else -1
 
-    # Only support GPU training for batched_emb
+    # Only support GPU training for batched_emb or fbgemm_emb
     assert not (args.batched_emb and not args.use_gpu)
+    assert not (args.fbgemm_emb and not args.use_gpu)
 
     ### construct the neural network specified above ###
     # WARNING: to obtain exactly the same initialization for
@@ -1476,6 +1614,10 @@ def run():
         weighted_pooling=args.weighted_pooling,
         loss_function=args.loss_function,
         batched_emb=args.batched_emb,
+        fbgemm_emb=args.fbgemm_emb,
+        load_processed=args.load_processed,
+        sharder=args.sharder,
+        allocation=args.allocation
     )
 
     # test prints
@@ -1516,7 +1658,7 @@ def run():
             if ext_dist.my_size == 1
             else [
                 {
-                    "params": [p for p in dlrm.emb_l.parameters()] if args.batched_emb else [p for emb in dlrm.emb_l for p in emb.parameters()],
+                    "params": [p for p in dlrm.emb_l.parameters()] if args.batched_emb or args.fbgemm_emb else [p for emb in dlrm.emb_l for p in emb.parameters()],
                     "lr": args.learning_rate,
                 },
                 # TODO check this lr setup
@@ -1677,7 +1819,9 @@ def run():
     writer = SummaryWriter(tb_file)
 
     ext_dist.barrier()
-    with torch.autograd.profiler.profile(args.enable_profiling, use_cuda=use_gpu, use_kineto=True, record_shapes=False) as prof:
+    with torch.autograd.profiler.profile(
+        args.enable_profiling, use_cuda=use_gpu, use_kineto=True, record_shapes=False
+    ) as prof:
         if not args.inference_only:
             k = 0
             while k < args.nepochs:
@@ -1722,7 +1866,7 @@ def run():
 
                         X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
                         with record_function("DLRM distribute emb data"):
-                            if dlrm.batched_emb:
+                            if dlrm.batched_emb or dlrm.fbgemm_emb:
                                 if ndevices > 1 or ext_dist.my_size > 1:
                                     lS_o, lS_i = dlrm.distribute_batched_emb_data(X.size()[0], lS_o, lS_i)
 
@@ -1987,11 +2131,11 @@ def run():
         if ext_dist.my_size > 1: # Multiple trace files for distributed training
             with open("dlrm_s_pytorch_{}.prof".format(ext_dist.my_local_rank), "w") as prof_f:
                 prof_f.write(prof.key_averages().table(sort_by="self_cpu_time_total"))
-            prof.export_chrome_trace("dlrm_s_pytorch_{}.json".format(ext_dist.my_local_rank))
+            prof.export_chrome_trace(os.path.join(args.profile_out_dir, "dlrm_s_pytorch_{}.json".format(ext_dist.my_local_rank)))
         else:
             with open("dlrm_s_pytorch.prof", "w") as prof_f:
                 prof_f.write(prof.key_averages().table(sort_by="self_cpu_time_total"))
-            prof.export_chrome_trace("dlrm_s_pytorch.json")
+            prof.export_chrome_trace(args.profile_out_dir(args.profile_out_dir, "dlrm_s_pytorch.json"))
         # print(prof.key_averages().table(sort_by="cpu_time_total"))
 
     # plot compute graph

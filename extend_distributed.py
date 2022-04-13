@@ -66,39 +66,13 @@ def get_split_lengths(n):
     return (my_len, splits)
 
 
-# get device indices for tables
-# e.g 8 tables, No. [1,3,5,6] on device 0, No. [2,4,7,8] on device 1, then
-# return [0, 1, 0, 1, 0, 0, 1, 1]
-# N.B.: only for single-node multi-GPU for now.
-def get_device_indices_for_tables(T, Es, ndevices, balancing_type="naive_chunk"):
-    assert ndevices <= T # More tables than devices
-    if balancing_type == "greedy": # Simple greedy load balancing
-        buckets = [0] * ndevices
-        table_device_indices = [0] * T # Mapping of embedding tables to devices
-        for k, E in enumerate(Es):
-            device_idx = buckets.index(min(buckets))
-            buckets[device_idx] += E
-            table_device_indices[k] = device_idx # Which table goes to which device
-        return table_device_indices
-    elif balancing_type == "naive_mod":
-        return [(x % ndevices) for x in Es]
-    elif balancing_type == "naive_chunk":
-        l, splits = get_split_lengths(T)
-        splits = [l] * ndevices if splits is None else splits
-        table_device_indices = []
-        for idx, s in enumerate(splits):
-            table_device_indices.extend([idx] * s)
-        return table_device_indices
-    raise Exception("Unknown load balancing type!")
-
-
 # N.B.: only for multi-node single-GPU for now.
 def get_my_emb_indices_from_device_indices(inds):
     return [idx for idx, ind in enumerate(inds) if my_rank == ind]
 
 
 def get_splits_from_device_indices(inds):
-    counts = [0] * (max(inds) + 1)
+    counts = [0] * my_size
     for ind in inds:
         counts[ind] += 1
     return counts
