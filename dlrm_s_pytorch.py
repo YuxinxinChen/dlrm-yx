@@ -1347,7 +1347,7 @@ def run():
     if not args.debug_mode:
         ext_dist.init_distributed(local_rank=args.local_rank, use_gpu=use_gpu, backend=args.dist_backend)
 
-    if not os.path.exists(args.profile_out_dir):
+    if args.enable_profiling and not os.path.exists(args.profile_out_dir):
         if ext_dist.my_local_rank == 0:
             os.makedirs(args.profile_out_dir)
 
