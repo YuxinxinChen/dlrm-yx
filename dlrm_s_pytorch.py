@@ -125,7 +125,7 @@ def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, ndevices=1):
     if use_gpu:
         # lS_i can be either a list of tensors or a stacked tensor.
         # Handle each case below:
-        with record_function("module::get_batch_data"):
+        with record_function("## Transfer GPU data ##"):
             if ndevices == 1: # Assuming each rank has only one GPU. TODO: Support single-rank multi-GPU.
                 if ext_dist.my_size > 1: # Multi-GPU
                     batch_size = X.size()[0]
@@ -163,12 +163,12 @@ def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, ndevices=1):
                 )
             X = X.to(device)
 
-    with record_function("DLRM forward"):
+    with record_function("## Forward ##"):
         return dlrm(X, lS_o, lS_i)
 
 
 def loss_fn_wrap(Z, T, device):
-    with record_function("DLRM loss compute"):
+    with record_function("## Loss Compute ##"):
         if args.loss_function == "mse" or args.loss_function == "bce":
             return dlrm.loss_fn(Z, T.to(device))
         elif args.loss_function == "wbce":
@@ -1040,7 +1040,7 @@ def inference(
         X_test, lS_o_test, lS_i_test, T_test, W_test, CBPP_test = unpack_batch(
             testBatch
         )
-        with record_function("DLRM distribute emb data"):
+        with record_function("## Distribute emb data ##"):
             if dlrm.batched_emb or dlrm.fbgemm_emb:
                 if ndevices > 1 or ext_dist.my_size > 1:
                     lS_o_test, lS_i_test = dlrm.distribute_batched_emb_data(X_test.size()[0], lS_o_test, lS_i_test)
@@ -1074,7 +1074,7 @@ def inference(
             scores.append(S_test)
             targets.append(T_test)
         else:
-            with record_function("DLRM accuracy compute"):
+            with record_function("## Accuracy Compute ##"):
                 # compute loss and accuracy
                 S_test = Z_test.detach().cpu().numpy()  # numpy array
                 T_test = T_test.detach().cpu().numpy()  # numpy array
@@ -1086,7 +1086,7 @@ def inference(
                 test_samp += mbs_test
 
     if args.mlperf_logging:
-        with record_function("DLRM mlperf sklearn metrics compute"):
+        with record_function("## MLPerf sklearn metrics compute ##"):
             scores = np.concatenate(scores, axis=0)
             targets = np.concatenate(targets, axis=0)
 
@@ -1851,7 +1851,7 @@ def run():
                         continue
 
                     X, lS_o, lS_i, T, W, _ = unpack_batch(inputBatch)
-                    with record_function("DLRM distribute emb data"):
+                    with record_function("## Distribute emb data ##"):
                         if dlrm.batched_emb or dlrm.fbgemm_emb:
                             if ndevices > 1 or ext_dist.my_size > 1:
                                 lS_o, lS_i = dlrm.distribute_batched_emb_data(X.size()[0], lS_o, lS_i)
@@ -1913,7 +1913,7 @@ def run():
                     # A = np.sum((np.round(S, 0) == T).astype(np.uint8))
                     # A_shifted = np.sum((np.round(S_shifted, 0) == T).astype(np.uint8))
 
-                    with record_function("DLRM backward"):
+                    with record_function("## Backward ##"):
                         # scaled error gradient propagation
                         # (where we do not accumulate gradients across mini-batches)
                         if (args.mlperf_logging and (j + 1) % args.mlperf_grad_accum_iter == 0) or not args.mlperf_logging:
