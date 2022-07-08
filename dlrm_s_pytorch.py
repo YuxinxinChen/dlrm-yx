@@ -122,48 +122,48 @@ def time_wrap(use_gpu):
 
 
 def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, ndevices=1):
-    if use_gpu:
-        # lS_i can be either a list of tensors or a stacked tensor.
-        # Handle each case below:
-        with record_function("## Transfer GPU data ##"):
-            if ndevices == 1: # Assuming each rank has only one GPU. TODO: Support single-rank multi-GPU.
-                if ext_dist.my_size > 1: # Multi-GPU
-                    batch_size = X.size()[0]
-                    # WARNING: # of ranks must be <= batch size in distributed_forward call
-                    if batch_size < ext_dist.my_size:
-                        sys.exit(
-                            "ERROR: batch_size (%d) must be larger than number of ranks (%d)"
-                            % (batch_size, ext_dist.my_size)
-                        )
-                    if batch_size % ext_dist.my_size != 0:
-                        sys.exit(
-                            "ERROR: batch_size %d can not split across %d ranks evenly"
-                            % (batch_size, ext_dist.my_size)
-                        )
-
-                    X = X[ext_dist.get_my_slice(batch_size)]
-                    if not dlrm.batched_emb and not dlrm.fbgemm_emb:
-                        lS_o = [lS_o[i] for i in dlrm.local_emb_indices]
-                        lS_i = [lS_i[i] for i in dlrm.local_emb_indices]
-
-                        if (len(dlrm.emb_l) != len(lS_o)) or (len(dlrm.emb_l) != len(lS_i)):
+    with record_function("## Forward ##"):
+        if use_gpu:
+            # lS_i can be either a list of tensors or a stacked tensor.
+            # Handle each case below:
+            with record_function("module::forward_pass"):
+                if ndevices == 1: # Assuming each rank has only one GPU. TODO: Support single-rank multi-GPU.
+                    if ext_dist.my_size > 1: # Multi-GPU
+                        batch_size = X.size()[0]
+                        # WARNING: # of ranks must be <= batch size in distributed_forward call
+                        if batch_size < ext_dist.my_size:
                             sys.exit(
-                                "ERROR: corrupted model input detected in distributed_forward call"
+                                "ERROR: batch_size (%d) must be larger than number of ranks (%d)"
+                                % (batch_size, ext_dist.my_size)
+                            )
+                        if batch_size % ext_dist.my_size != 0:
+                            sys.exit(
+                                "ERROR: batch_size %d can not split across %d ranks evenly"
+                                % (batch_size, ext_dist.my_size)
                             )
 
-                lS_i = (
-                    [S_i.to(device) for S_i in lS_i]
-                    if isinstance(lS_i, list)
-                    else lS_i.to(device)
-                )
-                lS_o = (
-                    [S_o.to(device) for S_o in lS_o]
-                    if isinstance(lS_o, list)
-                    else lS_o.to(device)
-                )
-            X = X.to(device)
+                        X = X[ext_dist.get_my_slice(batch_size)]
+                        if not dlrm.batched_emb and not dlrm.fbgemm_emb:
+                            lS_o = [lS_o[i] for i in dlrm.local_emb_indices]
+                            lS_i = [lS_i[i] for i in dlrm.local_emb_indices]
 
-    with record_function("## Forward ##"):
+                            if (len(dlrm.emb_l) != len(lS_o)) or (len(dlrm.emb_l) != len(lS_i)):
+                                sys.exit(
+                                    "ERROR: corrupted model input detected in distributed_forward call"
+                                )
+
+                    lS_i = (
+                        [S_i.to(device) for S_i in lS_i]
+                        if isinstance(lS_i, list)
+                        else lS_i.to(device)
+                    )
+                    lS_o = (
+                        [S_o.to(device) for S_o in lS_o]
+                        if isinstance(lS_o, list)
+                        else lS_o.to(device)
+                    )
+                X = X.to(device)
+
         return dlrm(X, lS_o, lS_i)
 
 
