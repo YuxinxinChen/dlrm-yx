@@ -126,7 +126,7 @@ def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, ndevices=1):
         if use_gpu:
             # lS_i can be either a list of tensors or a stacked tensor.
             # Handle each case below:
-            with record_function("module::forward_pass"):
+            with record_function("module::forward_pass::transfer_gpu_data"):
                 if ndevices == 1: # Assuming each rank has only one GPU. TODO: Support single-rank multi-GPU.
                     if ext_dist.my_size > 1: # Multi-GPU
                         batch_size = X.size()[0]
