@@ -484,7 +484,7 @@ class All2All_Wait(Function):
                 outputs = [out.view([a2a_info.local_batch_num, -1, a2a_info.emb_dim]) for out in outputs]
             else:
                 outputs = [out.view([a2a_info.local_batch_num, -1]) for out in outputs]
-            return outputs
+            return tuple(outputs)
 
     @staticmethod
     def backward(ctx, *grad_outputs):
