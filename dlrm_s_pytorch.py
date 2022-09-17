@@ -647,7 +647,7 @@ class DLRM_Net(nn.Module):
             offset = 0 if self.arch_interaction_itself else -1
             #      ---------------
             #      approach 1: tril_indices
-            li, lj = torch.tril_indices(ni, nj, offset=offset)
+            li, lj = torch.tril_indices(ni, nj, offset=offset, device=Z.device)
             #      ---------------
             #      approach 2: custom
             # li = torch.tensor([i for i in range(ni) for _ in range(i + 1 + offset)])
