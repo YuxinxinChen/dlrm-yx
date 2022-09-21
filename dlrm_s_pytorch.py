@@ -1290,8 +1290,13 @@ def run():
     parser.add_argument("--lr-num-warmup-steps", type=int, default=0)
     parser.add_argument("--lr-decay-start-step", type=int, default=0)
     parser.add_argument("--lr-num-decay-steps", type=int, default=0)
+    # DDP gradient bucket size
+    parser.add_argument("--bucket-size-mb", type=int, default=25)
     # execution graph
     parser.add_argument("--collect-execution-graph", action="store_true", default=False)
+    parser.add_argument("--aggregated-allreduce", action="store_true", default=False)
+    # barrier at iteration start
+    parser.add_argument("--early-barrier", action="store_true", default=False)
 
     global args
     global nbatches
@@ -1621,8 +1626,8 @@ def run():
     if ext_dist.my_size > 1:
         if use_gpu:
             device_ids = [ext_dist.my_local_rank]
-            dlrm.bot_l = ext_dist.DDP(dlrm.bot_l, device_ids=device_ids)
-            dlrm.top_l = ext_dist.DDP(dlrm.top_l, device_ids=device_ids)
+            dlrm.bot_l = ext_dist.DDP(dlrm.bot_l, device_ids=device_ids, bucket_cap_mb=args.bucket_size_mb)
+            dlrm.top_l = ext_dist.DDP(dlrm.top_l, device_ids=device_ids, bucket_cap_mb=args.bucket_size_mb)
         else:
             dlrm.bot_l = ext_dist.DDP(dlrm.bot_l)
             dlrm.top_l = ext_dist.DDP(dlrm.top_l)
@@ -1841,20 +1846,22 @@ def run():
                     end_event = torch.cuda.Event(enable_timing=True)
 
                 for j, inputBatch in enumerate(train_ld):
-                    if j == 0:
-                        if args.collect_execution_graph:
-                            eg.start()
-                        if args.save_onnx:
-                            X_onnx, lS_o_onnx, lS_i_onnx, _, _, _ = unpack_batch(inputBatch)
+                    if j == 0 and args.save_onnx:
+                        X_onnx, lS_o_onnx, lS_i_onnx, _, _, _ = unpack_batch(inputBatch)
+                    if args.collect_execution_graph and j == (0 if args.aggregated_allreduce else 1):
+                        eg.start()
 
                     if j < skip_upto_batch:
                         continue
 
                     X, lS_o, lS_i, T, W, _ = unpack_batch(inputBatch)
-                    with record_function("## Distribute emb data ##"):
-                        if dlrm.batched_emb or dlrm.fbgemm_emb:
+                    if dlrm.batched_emb or dlrm.fbgemm_emb:
+                        with record_function("## Distribute emb data ##"):
                             if ndevices > 1 or ext_dist.my_size > 1:
                                 lS_o, lS_i = dlrm.distribute_batched_emb_data(X.size()[0], lS_o, lS_i)
+                                # Sync all ranks for benchmark purpose: otherwise comm might need to wait.
+                                if args.early_barrier:
+                                    torch.distributed.barrier()
 
                     if args.mlperf_logging:
                         current_time = time_wrap(use_gpu)
@@ -1937,7 +1944,7 @@ def run():
                             t2 = time_wrap(use_gpu)
                             total_time += t2 - t1
 
-                    if j == 0 and args.collect_execution_graph:
+                    if args.collect_execution_graph and j == (0 if args.aggregated_allreduce else 1):
                         eg.stop()
                         eg.unregister_callback()
 
