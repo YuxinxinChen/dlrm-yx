@@ -254,19 +254,25 @@ class DLRM_Net(nn.Module):
                     device=dev,
                     dtype=torch.float32
                 )
-                #all_embedding_data.append(nn.Parameter(embedding_data))
                 all_embedding_data.append(embedding_data)
+                table_offsets_data = torch.tensor(
+                    [0]
+                    + np.cumsum(self.device_table_partition[dev][:-1]).tolist(),
+                    device=dev,
+                    dtype = torch.int32
+                )
+                all_talbe_offsets.append(table_offsets_data)
             elif managed == EmbeddingLocation.HOST_MAPPED:
                 print("Allocating host-mapped embedding bag")
                 embedding_data = torch.randn(
                     size=(Ext, self.m_spa),
                     dtype=torch.float32
                 )
-            all_talbe_offsets.append(torch.tensor(
+                all_talbe_offsets.append(torch.tensor(
                     [0]
                     + np.cumsum(self.device_table_partition[dev][:-1]).tolist()
                 , dtype=torch.int32)
-            )
+                )
         self.all_embedding_weights = all_embedding_data
         self.all_table_offsets = all_talbe_offsets
         self.optimizer = optimizer

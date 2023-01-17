@@ -289,193 +289,25 @@ std::vector<Tensor> batched_embedding_forward_cuda(TensorList weights,
     auto tmp_output = empty({B, T, D}, weights[dev_id].options());
     output_vec.push_back(tmp_output);
     Device device(kCUDA, reside_device);
-    Tensor input_table_offsets = table_offsets[dev_id].to(device);
     Tensor input_indices = indices[dev_id].to(device);
     Tensor input_offsets = offsets[dev_id].to(device);
     std::cout << weights[dev_id].options() << std::endl;
-    std::cout << input_table_offsets.options() << std::endl;
+    std::cout << table_offsets[dev_id].options() << std::endl;
     std::cout << input_indices.options() << std::endl;
     std::cout << input_offsets.options() << std::endl;
     std::cout << output_vec[dev_id].options() << std::endl;
-    AT_DISPATCH_FLOATING_TYPES(weights[dev_id].type(), "hello_cuda", 
+    AT_DISPATCH_FLOATING_TYPES(weights[dev_id].type(), "kernel", 
      ([&] {
-        //batched_embedding_forward_kernel_1<scalar_t, false><<<blocks, threads, 0>>>
-	       //(weights[dev_id]).packed_accessor32<scalar_t, 2, RestrictPtrTraits>(),
-        // (table_offsets[dev_id]).packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-        // (indices[dev_id]).packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-        // (offsets[dev_id]).packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-        // output.packed_accessor32<scalar_t, 3, UnweightedForward>(),
-        // static_cast<int32_t>(L_max), UnweightedForward<scalar_t>() 
-        //);
         batched_embedding_forward_kernel_1<scalar_t, false><<<blocks, threads>>>
 	      ((weights[dev_id]).packed_accessor32<scalar_t, 2, RestrictPtrTraits>(),
-         input_table_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+         (table_offsets[dev_id]).packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
          input_indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
          input_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
          output_vec[dev_id].packed_accessor32<scalar_t, 3, RestrictPtrTraits>(),
          static_cast<int32_t>(L_max), UnweightedForward<scalar_t>()
         );
     }));
-    //AT_DISPATCH_FLOATING_TYPES(weights[dev_id].type(), 
-    //  'kernel',
-    //  ([&] {
-    //    batched_embedding_forward_kernel_1<scalar_t, shmem><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>
-    //    (weights[dev_id].packed_accessor64<scalar_t, 2, RestrictPtrTraits>(),
-    //    table_offsets[dev_id].packed_accessor32<int, 1, RestrictPtrTraits>(),
-    //    indices[dev_id].packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-    //    offsets[dev_id].packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-    //    static_cast<int32_t>(L_max), UnweightedForward<scalar_t>());
-    //  })
-    //);
-    //AT_CUDA_CHECK(cudaGetLastError());
+    AT_CUDA_CHECK(cudaGetLastError());
   }
-  cudaSetDevice(0);
-  cudaDeviceSynchronize();
-  cudaSetDevice(1);
-  cudaDeviceSynchronize();
   return output_vec;
 }
-
-/*
-static void CUDAManagedDeleter(void *ptr) { AT_CUDA_CHECK(cudaFree(ptr)); }
-
-struct CUDAManagedAllocator final : public at::Allocator {
-  at::DataPtr allocate(size_t size) const override {
-    void *ptr;
-    AT_CUDA_CHECK(cudaMallocManaged(&ptr, size));
-    AT_CUDA_CHECK(cudaMemAdvise(ptr, size, cudaMemAdviseSetPreferredLocation,
-                                cudaCpuDeviceId));
-    AT_CUDA_CHECK(cudaMemAdvise(ptr, size, cudaMemAdviseSetAccessedBy,
-                                at::cuda::current_device()));
-    return {ptr,
-            ptr,
-            &CUDAManagedDeleter,
-            {at::DeviceType::CUDA, at::cuda::current_device()}};
-  }
-
-  at::DeleterFnPtr raw_deleter() const override { return &CUDAManagedDeleter; }
-};
-
-static CUDAManagedAllocator g_managed_allocator;
-
-static void CUDAHostMappedDeleter(void *ptr) {
-  AT_CUDA_CHECK(cudaFreeHost(ptr));
-}
-
-struct CUDAHostMappedAllocator final : public at::Allocator {
-  at::DataPtr allocate(size_t size) const override {
-    void *ptr;
-    AT_CUDA_CHECK(cudaHostAlloc(&ptr, size, cudaHostAllocWriteCombined |
-                                                cudaHostAllocMapped));
-
-    void *dev_ptr;
-    AT_CUDA_CHECK(cudaHostGetDevicePointer(&dev_ptr, ptr, 0));
-    return {dev_ptr,
-            ptr,
-            &CUDAHostMappedDeleter,
-            {at::DeviceType::CUDA, at::cuda::current_device()}};
-  }
-
-  at::DeleterFnPtr raw_deleter() const override {
-    return &CUDAHostMappedDeleter;
-  }
-};
-
-static CUDAHostMappedAllocator g_host_mapped_allocator;
-
-std::vector<int64_t> defaultStrides(IntArrayRef sizes) {
-  std::vector<int64_t> strides(sizes.size());
-  int64_t stride = 1;
-  for (size_t i = sizes.size(); i > 0; --i) {
-    strides[i - 1] = stride;
-    stride *= sizes[i - 1];
-  }
-  return strides;
-}
-
-int64_t computeStorageSize(IntArrayRef sizes, IntArrayRef strides) {
-  // size of the underlying storage is 1 bigger than the offset
-  // of the last element according to stride
-  int64_t size = 1;
-  for (size_t i = 0; i < sizes.size(); i++) {
-    if (sizes[i] == 0) {
-      return 0;
-    }
-    size += strides[i] * (sizes[i] - 1);
-  }
-  return size;
-}
-
-Tensor new_managed_tensor(Tensor self, std::vector<std::int64_t> sizes) {
-  auto strides = defaultStrides(sizes);
-  auto storage = Storage(Storage::use_byte_size_t(), computeStorageSize(sizes, strides),
-                         &g_managed_allocator,
-                         resizable=false);
-  auto tensor = at::empty({0}, self.options()).set_(storage, 0, sizes, strides);
-  return tensor;
-}
-
-Tensor new_host_mapped_tensor(Tensor self, std::vector<std::int64_t> sizes) {
-  auto strides = defaultStrides(sizes);
-  auto storage = Storage(Storage::use_byte_size_t(), computeStorageSize(sizes, strides),
-                         &g_host_mapped_allocator,
-                         resizable=false);
-  auto tensor = at::empty({0}, self.options()).set_(storage, 0, sizes, strides);
-  return tensor;
-}
-
-__global__ void construct_offsets_kernel(
-    const PackedTensorAccessor32<int32_t, 2, RestrictPtrTraits>
-        batch_offsets_per_table,
-    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
-        total_indices_per_table,
-    PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> output) {
-  const int32_t T = batch_offsets_per_table.size(0);
-  const int32_t B = batch_offsets_per_table.size(1);
-
-  // do warp-per-D (so only need warp reduction)
-  int32_t b_t = blockIdx.x * blockDim.x + threadIdx.x;
-  int32_t b = b_t % B;
-  int32_t t = b_t / B;
-  if (t < T) {
-    int32_t upper = 0;
-    if (b != B - 1) {
-      upper = batch_offsets_per_table[t][b + 1];
-    } else {
-      upper = total_indices_per_table[t];
-    }
-    int32_t lower = batch_offsets_per_table[t][b];
-    output[1 + t * B + b] = upper - lower;
-  }
-}
-
-Tensor construct_offsets(Tensor batch_offsets_per_table, // [T][B]
-                         Tensor total_indices_per_table  // [T]
-                         ) {
-  at::cuda::OptionalCUDAGuard device_guard;
-  device_guard.set_index(batch_offsets_per_table.get_device());
-
-  const auto T = batch_offsets_per_table.size(0);
-  const auto B = batch_offsets_per_table.size(1);
-  const dim3 threads(kMaxThreads);
-  const dim3 blocks((B * T + 1 + kMaxThreads - 1) / kMaxThreads);
-
-  Tensor output =
-      at::zeros({1 + B * T}, batch_offsets_per_table.options().dtype(kInt));
-
-  construct_offsets_kernel<<<blocks, threads, 0,
-                             at::cuda::getCurrentCUDAStream()>>>(
-      batch_offsets_per_table
-          .packed_accessor32<int32_t, 2, RestrictPtrTraits>(),
-      total_indices_per_table
-          .packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-      output.packed_accessor32<int32_t, 1, RestrictPtrTraits>());
-  AT_CUDA_CHECK(cudaGetLastError());
-  return output;
-}
-
-struct IndexInfo {
-  int32_t b_t;
-  int32_t indices_idx;
-};
-*/
