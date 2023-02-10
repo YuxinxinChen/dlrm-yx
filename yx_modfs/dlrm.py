@@ -7,6 +7,7 @@ import numpy as np
 from numpy import random as ra
 import torch
 import torch.nn as nn
+import torch.cuda.nccl as nccl
 
 sys.path.append('/home/yuxin420/dlrm-yx/yx_modfs/build/lib.linux-x86_64-cpython-310')
 
@@ -119,18 +120,36 @@ class LookupFunction(torch.autograd.Function):
             L_max,
             BT_block_size,
             False)
-        print(res[0]) 
-        print(res[1]) 
-        #print(weights)
-        #a = torch.tensor([[1, 2, 3], [4, 5, 6]])
-        #print(type(a))
-        #return table_batched_embeddings_yx.hello(
-        #    [a,a]
-            #weights,
-            #BT_block_size,
-            #False
-        #)
+        min_gather_size = table_offsets[0].shape[0]
+        for i in range(ndevices):
+            min_gather_size = min(min_gather_size, table_offsets[i].shape[0])
 
+        gather_res = []
+        for i in range(ndevices):
+            gather_res.append(res[i].reshape(-1)[0:args.batches_size*min_gather_size*embedding_dimension])
+        gather_outputs = [torch.zeros(args.batches_size*min_gather_size*embedding_dimension*ndevices, device=i, dtype=torch.float32) for i in range(ndevices)]
+
+        for i in range(ndevices):
+            gather_res[i].reshape(args.batches_size, min_gather_size, embedding_dimension)
+            gather_outputs[i].reshape(args.batches_size, ndevices*min_gather_size, embedding_dimension)
+        nccl.all_gather(gather_res, gather_outputs)
+
+        broadcast_outputs =[]
+        for i in range(ndevices):
+            if res[i].reshape(-1).shape[0] > args.batches_size*min_gather_size*embedding_dimension:
+                broadcast_outputs.append(res[i].reshape(-1)[args.batches_size*min_gather_size*embedding_dimension:len(res[i].reshape(-1))])
+        for i in range(ndevices):
+            if res[i].reshape(-1).shape[0] <= args.batches_size*min_gather_size*embedding_dimension:
+                broadcast_outputs.append(torch.zeros(args.batches_size*embedding_dimension, device=i,dtype=torch.float32))
+        nccl.broadcast(broadcast_outputs)
+
+        outputs=[]
+        outputs.append([])
+        outputs.append([])
+        for i in range(ndevices):
+            outputs[i].append(gather_outputs[i].reshape(args.batches_size, -1, embedding_dimension) + broadcast_outputs[i].reshape(args.batches_size,-1,embedding_dimension))
+
+        return outputs
 
 class DLRM_Net(nn.Module):
     #def create_emb(self, emb_vec_dim, ln):
@@ -337,7 +356,7 @@ def run():
         for dev_id in range(dlrm.ndevices):
             merged_offsets.append(partitioned_offsets_batches[dev_id][bid])
             merged_indices.append(partitioned_indices_batches[dev_id][bid])
-        dlrm(merged_indices, merged_offsets)
+        outputs = dlrm(merged_indices, merged_offsets)
 
     #dlrm(partitioned_indices, partitioned_offsets)
 
