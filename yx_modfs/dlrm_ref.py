@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from numpy import random as ra
+from torch.autograd.profiler import record_function
 
 class EmbeddingLocation(enum.Enum):
     DEVICE = 0
@@ -108,7 +109,6 @@ class DLRM_Net(nn.Module):
                 t.cuda()
 
 
-
     def create_emb_batched(self, learning_rate=0.1):
         all_embedding_data = []
 
@@ -152,7 +152,30 @@ class DLRM_Net(nn.Module):
             else:
                 self.create_emb(EmbeddingLocation.HOST_MAPPED)
 
+    def apply_mlp(self, x, layers):
+        return layers(x)
+    
+    def apply_emb(self, indices, offsets):
+        return [self.emb_l[i](indices[i], offsets[i]) for i in range(len(self.ln_emb))]
 
+    def interact_features(self, x, ly):
+        return torch.cat(([x]+ly), dim=1)
+
+    def sequential_forward(self, dense_input, indices, offsets):
+        with record_function("module::forward_pass::bottom_mlp"):
+            x = self.apply_mlp(dense_input, self.bot_l)
+        with record_function("module::forward_pass::embedding_lookups"):
+            ly = self.apply_emb(indices, offsets)
+        with record_function("module::forward_pass::interaction"):
+            z = self.interact_features(x, ly)
+        with record_function("module::forward_pass::top_mlp"):
+            p = self.apply_mlp(z, self.top_l)
+        
+        return p
+
+    def forward(self, dense_input, indices,offsets):
+        if self.ndevices <= 1:
+            return self.sequential_forward(dense_input, indices, offsets)
 
 def dash_separated_ints(value):
     vals = value.split("-")
@@ -183,7 +206,7 @@ def run():
     parser.add_argument("--rand-seed", type=int, default=12321) 
 
     parser.add_argument("--arch-mlp-bot", type=dash_separated_ints, default="4-3-2")
-    parser.add_argument("--arch-mlp-top", type=dash_separated_ints, default="4-2-1")
+    parser.add_argument("--arch-mlp-top", type=dash_separated_ints, default="14-2-1")
 
     global args
     args = parser.parse_args()
@@ -193,13 +216,15 @@ def run():
     ln_bot = np.fromstring(args.arch_mlp_bot, dtype=int, sep="-")
     use_gpu = args.use_gpu and torch.cuda.is_available()
 
+    assert(ln_top[0] == args.sparse_feature_size*len(ln_emb)+ln_bot[-1])
+
     ndevices = -1
     if use_gpu:
         ngpus = torch.cuda.device_count()
         assert ngpus >= args.world_size
         ndevices = args.world_size
     
-    dlrm = DLRM_Net(args.sparse_feature_size, ln_emb, ln_top, ln_bot, ndevices)
+    dlrm = DLRM_Net(args.sparse_feature_size, ln_emb, ln_bot,ln_top, ndevices)
     print(dlrm.top_l)
     print(next(dlrm.top_l.parameters()).is_cuda)
     print(dlrm.bot_l)
@@ -211,6 +236,20 @@ def run():
     dataset.print_sparse()
     dataset.print_dens()
 
+
+    for bid in range(dataset.num_batches):
+        indices = []
+        offsets = []
+        for i in range(len(ln_emb)):
+            indices.append(dataset.indices_list[bid][args.batches_size*i*args.indices_per_lookup:args.batches_size*(i+1)*args.indices_per_lookup])
+            offsets.append(dataset.offsets_list[bid][args.batches_size*i:args.batches_size*(i+1)]-dataset.offsets_list[bid][args.batches_size*i])
+        dense_x = dataset.dens_inputs[bid]
+        if use_gpu:
+            dense_x = dense_x.cuda()
+            for i in range(len(ln_emb)):
+                indices[i] = indices[i].cuda()
+                offsets[i] = offsets[i].cuda()
+        out = dlrm(dense_x, indices, offsets)
 
 if __name__ == "__main__":
     run()
