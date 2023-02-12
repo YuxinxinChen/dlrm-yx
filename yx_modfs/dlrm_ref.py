@@ -5,7 +5,6 @@ import enum
 import numpy as np
 import torch
 import torch.nn as nn
-from numpy import random as ra
 from torch.autograd.profiler import record_function
 
 class EmbeddingLocation(enum.Enum):
@@ -39,6 +38,7 @@ class RandomDataset():
         self.rand_data_dis = rand_data_dis
 
         torch.random.manual_seed(self.rand_seed)
+        np.random.seed(self.rand_seed)
 
         n_emb = len(ln_emb)
         tmp_offsets_list = []
@@ -51,7 +51,7 @@ class RandomDataset():
             (tmp_indices, tmp_offsets) = get_table_batched_offsets_from_dense(merged_indices)
             tmp_offsets_list.append(tmp_offsets)
             tmp_indices_list.append(tmp_indices)
-            tmp_dens.append(torch.tensor(ra.rand(batch_size, m_den).astype(np.float32)))
+            tmp_dens.append(torch.tensor(np.random.rand(batch_size, m_den).astype(np.float32)))
         self.offsets_list = tmp_offsets_list
         self.indices_list = tmp_indices_list
         self.dens_inputs = tmp_dens
@@ -121,6 +121,7 @@ class DLRM_Net(nn.Module):
         ndevices=-1,
         sigmoid_bot=-1,
         sigmoid_top=-1,
+        rand_seed=12321,
     ):
         super(DLRM_Net, self).__init__()
         if (
@@ -134,6 +135,9 @@ class DLRM_Net(nn.Module):
             self.ln_bot = ln_bot
             self.ln_top = ln_top
             self.ndevices = ndevices
+            self.rand_seed = rand_seed
+            torch.manual_seed(self.rand_seed)
+            np.random.seed(self.rand_seed)
 
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
@@ -233,9 +237,8 @@ def run():
     print(next(dlrm.emb_l[0].parameters()).is_cuda)
 
     dataset = RandomDataset(ln_bot[0], dlrm.ln_emb, args.num_batches, args.batches_size, args.indices_per_lookup)
-    dataset.print_sparse()
-    dataset.print_dens()
-
+    #dataset.print_sparse()
+    #dataset.print_dens()
 
     for bid in range(dataset.num_batches):
         indices = []
