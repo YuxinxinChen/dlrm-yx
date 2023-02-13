@@ -6,6 +6,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.autograd.profiler import record_function
+import torch.cuda.nccl as nccl
+
+sys.path.append('/home/yuxin420/dlrm-yx/yx_modfs/build/lib.linux-x86_64-cpython-310')
 
 class EmbeddingLocation(enum.Enum):
     DEVICE = 0
@@ -74,6 +77,44 @@ class RandomDataset():
             print("batch ", i)
             print(self.dens_inputs[i])
 
+def get_split_len(items, persons):
+    k, m = divmod(items, persons)
+    splits = [(k+1) if i < m else k for i in range(persons)]
+    return splits
+
+def get_my_slice(items, persons, my_rank):
+    k, m = divmod(items, persons)
+    return slice(
+        my_rank * k + min(my_rank, m), (my_rank + 1) * k + min(my_rank + 1, m), 1
+    )
+
+class LookupFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        weights, 
+        table_offsets,
+        indices,
+        offsets,
+    ):
+        ndevices = len(weights)
+        embedding_dimension = weights[0].shape[1]
+        BT_block_size = int(max(512/embedding_dimension, 1))
+        L_max = int(embedding_dimension/4)*4
+
+        import table_batched_embeddings_yx.batched_forward
+        res = torch.ops.batched_forward.forward(
+            weights,
+            table_offsets,
+            offsets,
+            indices,
+            L_max,
+            BT_block_size,
+            False
+        )
+        
+        return res
+
 class DLRM_Net(nn.Module):
     def create_mlp(self, ln, sigmoid_layer):
         layers = nn.ModuleList()
@@ -109,8 +150,67 @@ class DLRM_Net(nn.Module):
                 t.cuda()
 
 
-    def create_emb_batched(self, learning_rate=0.1):
+    def create_emb_batched(self, 
+        managed=EmbeddingLocation.DEVICE):
+        assert managed in (EmbeddingLocation.DEVICE, EmbeddingLocation.HOST_MAPPED)
         all_embedding_data = []
+        all_table_offsets=[]
+
+        self.create_emb(EmbeddingLocation.HOST_MAPPED)
+        tmp_agg_by_device = []
+        for dev in range(self.ndevices):
+            tmp_agg_by_device.append([])
+        
+        for t in range(len(self.ln_emb)):
+            tmp_agg_by_device[self.table_device_indices[t]].append(self.emb_l[t].weight.data)    
+        
+        for (list, dev) in zip(tmp_agg_by_device, range(self.ndevices)):
+            if managed == EmbeddingLocation.DEVICE:
+                all_embedding_data.append(torch.cat(list).to(dev))
+                table_offsets_data = torch.tensor(
+                    [0] + 
+                    np.cumsum(self.device_table_indices[dev][:-1]).tolist(),
+                    device=dev,
+                    dtype=torch.int32
+                )
+                all_table_offsets.append(table_offsets_data)
+            elif managed == EmbeddingLocation.HOST_MAPPED:
+                all_embedding_data.append(torch.cat(list))
+                table_offsets_data = torch.tensor(
+                    [0] + 
+                    np.cumsum(self.device_table_indices[dev][:-1]).tolist(),
+                    dtype=torch.int32
+                )
+                all_table_offsets.append(table_offsets_data)
+    
+        #for dev in range(self.ndevices):
+        #    Ext = np.sum(self.device_table_indices[dev])
+        #    if managed == EmbeddingLocation.DEVICE:
+        #        embedding_data = torch.randn(
+        #            size=(Ext, self.m_spa),
+        #            device=dev,
+        #            dtype=torch.float32
+        #        )
+        #        all_embedding_data.append(embedding_data)
+        #        table_offsets_data = torch.tensor(
+        #            [0] +
+        #            np.cumsum(self.device_table_indices[dev][:-1]).tolist(),
+        #            device=dev,
+        #            dtype=torch.int32
+        #        )
+        #        all_table_offsets.append(table_offsets_data)
+        #    elif managed ==EmbeddingLocation.HOST_MAPPED:
+        #        embedding_data = torch.randn(
+        #            size=(Ext, self.m_spa),
+        #            dtype=torch.float32
+        #        )
+        #        all_table_offsets.append(torch.tensor(
+        #            [0] +
+        #            np.cumsum(self.device_table_indices[dev][:-1]).tolist(),
+        #            dtype=torch.int32)
+        #        )
+        self.all_embedding_weights = all_embedding_data
+        self.all_table_offsets = all_table_offsets
 
     def __init__(
         self,
@@ -148,8 +248,24 @@ class DLRM_Net(nn.Module):
                 n_emb = len(ln_emb)
                 if n_emb < self.ndevices:
                     sys.exit("%d embedding tables, %d GPUs, Not sufficient devices!" % (n_emb, self.ndevices))
+                self.n_emb_partition_table=get_split_len(n_emb, ndevices)
+
+                table_device_indices = [0]*n_emb
+                device_table_indices = []
+                for dev in range(ndevices):
+                    local_emb_slice = get_my_slice(n_emb, ndevices, dev)
+                    indices = range(local_emb_slice.start, local_emb_slice.stop, local_emb_slice.step)
+                    device_table_indices.append(self.ln_emb[local_emb_slice])
+                    for it in indices:
+                        table_device_indices[it] = dev
+                self.device_table_indices = device_table_indices
+                self.table_device_indices = table_device_indices
+                self.create_emb_batched(EmbeddingLocation.DEVICE)
+                self.top_l = torch.nn.DataParallel(self.top_l, device_ids=range(ndevices)).cuda()
+                self.bot_l = torch.nn.DataParallel(self.bot_l, device_ids=range(ndevices)).cuda()
 
             elif self.ndevices == 1:
+                self.table_device_indices = [0]*len(ln_emb)
                 self.create_emb(EmbeddingLocation.DEVICE)
                 self.top_l.cuda()
                 self.bot_l.cuda()
@@ -176,10 +292,71 @@ class DLRM_Net(nn.Module):
             p = self.apply_mlp(z, self.top_l)
         
         return p
+    
+    def parallel_forward(self, dense_input, indices, offsets):
+        with record_function("module::forwaard_pass::bottom_mlp"):
+            x = self.apply_mlp(dense_input, self.bot_l)
+        with record_function("module::forward_pass::embedding_lookups"):
+            ly = LookupFunction.apply(
+                self.all_embedding_weights,
+                self.all_table_offsets,
+                indices,
+                offsets
+            )
+            min_gather_size = self.all_table_offsets[0].shape[0]
+            for i in range(self.ndevices):
+                min_gather_size = min(min_gather_size, self.all_table_offsets[i].shape[0])
+
+            gather_ly = []
+            for i in range(self.ndevices):
+                gather_ly.append(ly[i].reshape(-1)[0:(x.shape[0]*min_gather_size*self.m_spa)])
+            gather_out = [torch.zeros(x.shape[0]*min_gather_size*self.m_spa*self.ndevices, device=i, dtype=ly[0].dtype) for i in range(self.ndevices)]
+
+            for i in range(self.ndevices):
+                gather_ly[i] = gather_ly[i].reshape(x.shape[0], min_gather_size, self.m_spa)
+                gather_out[i] = gather_out[i].reshape(x.shape[0], self.ndevices*min_gather_size, self.m_spa)
+            nccl.all_gather(gather_ly, gather_out)
+        with record_function("module::forward_pass::interaction"):
+            z = self.interact_features(x, [k for k in gather_out[0]])
+        with record_function("module::forward_pass::top_mlp"):
+            p = self.apply_mlp(z, self.top_l)
+        return p
 
     def forward(self, dense_input, indices,offsets):
         if self.ndevices <= 1:
             return self.sequential_forward(dense_input, indices, offsets)
+        elif self.ndevices > 1:
+            return self.parallel_forward(dense_input, indices, offsets)
+
+    def distributed_emb_inputs(self, indices, offsets):
+        n_emb = len(self.ln_emb)
+        assert n_emb == len(indices)
+        ndevices = self.ndevices
+        tmp_offsets = []
+        tmp_indices = []
+        emb_input_offsets = []
+        emb_input_indices = []
+        for dev in range(ndevices):
+            tmp_offsets.append([])
+            tmp_indices.append([])
+            emb_input_offsets.append([])
+            emb_input_indices.append([])
+
+        for i in range(len(indices)):
+            tmp_indices[self.table_device_indices[i]].append(indices[i]) 
+            offsets[i] = torch.cat((offsets[i], torch.tensor([len(indices[i])], dtype=offsets[i].dtype)), dim=0)
+            if not tmp_offsets[self.table_device_indices[i]]:
+                tmp_offsets[self.table_device_indices[i]].append(offsets[i])
+            else:
+                tmp_offsets[self.table_device_indices[i]].append(offsets[i][1:]+tmp_offsets[self.table_device_indices[i]][-1][-1])
+
+        for i in range(ndevices):
+            offset_agg = torch.cat(tmp_offsets[i])        
+            emb_input_offsets[i] = offset_agg
+            indices_agg = torch.cat(tmp_indices[i])
+            emb_input_indices[i] = indices_agg
+        return emb_input_indices, emb_input_offsets
+
 
 def dash_separated_ints(value):
     vals = value.split("-")
@@ -202,7 +379,7 @@ def run():
     parser.add_argument("--world-size", type=int, default=-1)    
     parser.add_argument("--sparse-feature-size", type=int, default=4)    
     parser.add_argument(
-        "--arch-embedding-size", type=dash_separated_ints, default="4-3-2"
+        "--arch-embedding-size", type=dash_separated_ints, default="4-3"
     )
     parser.add_argument("--num-batches", type=int, default=2)    
     parser.add_argument("--batches-size", type=int, default=2)    
@@ -210,7 +387,7 @@ def run():
     parser.add_argument("--rand-seed", type=int, default=12321) 
 
     parser.add_argument("--arch-mlp-bot", type=dash_separated_ints, default="4-3-2")
-    parser.add_argument("--arch-mlp-top", type=dash_separated_ints, default="14-2-1")
+    parser.add_argument("--arch-mlp-top", type=dash_separated_ints, default="10-2-1")
 
     global args
     args = parser.parse_args()
@@ -229,18 +406,22 @@ def run():
         ndevices = args.world_size
     
     dlrm = DLRM_Net(args.sparse_feature_size, ln_emb, ln_bot,ln_top, ndevices)
-    print(dlrm.top_l)
-    print(next(dlrm.top_l.parameters()).is_cuda)
-    print(dlrm.bot_l)
-    print(next(dlrm.bot_l.parameters()).is_cuda)
-    print(dlrm.emb_l)
-    print(next(dlrm.emb_l[0].parameters()).is_cuda)
+    #if ndevices == 1:
+    #    print(dlrm.emb_l[0].weight.data)
+    #    print(dlrm.emb_l[1].weight.data)
+    #print(dlrm.top_l)
+    #print(next(dlrm.top_l.parameters()).is_cuda)
+    #print(dlrm.bot_l)
+    #print(next(dlrm.bot_l.parameters()).is_cuda)
+    #print(dlrm.emb_l)
+    #print(next(dlrm.emb_l[0].parameters()).is_cuda)
 
     dataset = RandomDataset(ln_bot[0], dlrm.ln_emb, args.num_batches, args.batches_size, args.indices_per_lookup)
     #dataset.print_sparse()
     #dataset.print_dens()
 
     for bid in range(dataset.num_batches):
+        print("-------------batch %d------------" % bid)
         indices = []
         offsets = []
         for i in range(len(ln_emb)):
@@ -249,10 +430,21 @@ def run():
         dense_x = dataset.dens_inputs[bid]
         if use_gpu:
             dense_x = dense_x.cuda()
-            for i in range(len(ln_emb)):
-                indices[i] = indices[i].cuda()
-                offsets[i] = offsets[i].cuda()
+            if ndevices > 1:
+                (indices, offsets) = dlrm.distributed_emb_inputs(indices, offsets)
+                for i in range(len(indices)):
+                    indices[i] = indices[i].cuda(i)
+                    offsets[i] = offsets[i].cuda(i)
+            elif ndevices == 1:
+                for i in range(len(indices)):
+                    indices[i] = indices[i].cuda()
+                    offsets[i] = offsets[i].cuda()
+            print("offsets:")
+            print(offsets)
+            print("indices:")
+            print(indices)
         out = dlrm(dense_x, indices, offsets)
+        print(out)
 
 if __name__ == "__main__":
     run()
