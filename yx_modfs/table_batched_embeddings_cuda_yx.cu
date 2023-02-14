@@ -277,9 +277,11 @@ std::vector<Tensor> batched_embedding_forward_cuda(TensorList weights,
   int device_list[num_devices] = {0};
   for(int dev_id =0;dev_id<num_devices; dev_id++)
     device_list[dev_id] = weights[dev_id].get_device();
-  for(int iter = 0; iter<num_devices; iter++)
-    printf("%d\n", device_list[iter]);
-
+  cudaStream_t * s = (cudaStream_t *)malloc(sizeof(cudaStream_t)*num_devices);
+  for(int i=0;i<num_devices; i++) {
+    AT_CUDA_CHECK(cudaSetDevice(device_list[i]));
+    AT_CUDA_CHECK(cudaStreamCreateWithFlags(s+i, cudaStreamNonBlocking));
+  }
   NCCLCHECK(ncclCommInitAll(comms, num_devices, device_list));
 
   auto output_vec = std::vector<Tensor>();                     
@@ -299,16 +301,15 @@ std::vector<Tensor> batched_embedding_forward_cuda(TensorList weights,
   const dim3 blocks((B*T)/BT_block_size);
   printf("T=%ld, D=%ld,B=%ld\n", T, D, B);
 
-  for(int dev_id = 0; dev_id < num_devices; dev_id++)
+  for(int iter = 0; iter < num_devices; iter++)
   {
-    AT_ASSERT(dev_id == weights[dev_id].get_device());
-        
+    int dev_id = device_list[iter];
     cudaSetDevice(dev_id);
-    auto tmp_output = empty({B, T, D}, weights[dev_id].options());
+    auto tmp_output = empty({B, T, D}, weights[iter].options());
     output_vec.push_back(tmp_output);
     Device device(kCUDA, dev_id);
-    Tensor input_indices = indices[dev_id].to(device);
-    Tensor input_offsets = offsets[dev_id].to(device);
+    Tensor input_indices = indices[iter].to(device);
+    Tensor input_offsets = offsets[iter].to(device);
     /*
       std::cout << weights[dev_id].options() << std::endl;
       std::cout << table_offsets[dev_id].options() << std::endl;
@@ -317,18 +318,24 @@ std::vector<Tensor> batched_embedding_forward_cuda(TensorList weights,
       std::cout << output_vec[dev_id].options() << std::endl;
     */
     
-    AT_DISPATCH_FLOATING_TYPES(weights[dev_id].type(), "kernel", 
+    AT_DISPATCH_FLOATING_TYPES(weights[iter].type(), "kernel", 
      ([&] {
-        batched_embedding_forward_kernel_1<scalar_t, false><<<blocks, threads>>>
-	      ((weights[dev_id]).packed_accessor32<scalar_t, 2, RestrictPtrTraits>(),
-         (table_offsets[dev_id]).packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+        batched_embedding_forward_kernel_1<scalar_t, false><<<blocks, threads, 0, s[iter]>>>
+	      ((weights[iter]).packed_accessor32<scalar_t, 2, RestrictPtrTraits>(),
+         (table_offsets[iter]).packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
          input_indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
          input_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-         output_vec[dev_id].packed_accessor32<scalar_t, 3, RestrictPtrTraits>(),
+         output_vec[iter].packed_accessor32<scalar_t, 3, RestrictPtrTraits>(),
          static_cast<int32_t>(L_max), UnweightedForward<scalar_t>()
         );
     }));
     AT_CUDA_CHECK(cudaGetLastError());
+  }
+
+  for(int iter=0; iter<num_devices; iter++)
+  {
+    AT_CUDA_CHECK(cudaSetDevice(device_list[iter]));
+    AT_CUDA_CHECK(cudaStreamSynchronize(s[iter]));
   }
   return output_vec;
 }
