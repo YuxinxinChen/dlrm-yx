@@ -13,11 +13,21 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
+#include "nccl.h"
 #include <mutex>
 #include <vector>
 
 using namespace at;
 using namespace torch;
+
+#define NCCLCHECK(cmd) do {                         \
+  ncclResult_t res = cmd;                           \
+  if (res != ncclSuccess) {                         \
+    printf("Failed, NCCL error %s:%d '%s'\n",       \
+        __FILE__,__LINE__,ncclGetErrorString(res)); \
+    exit(EXIT_FAILURE);                             \
+  }                                                 \
+} while(0)
 
 #define DEVICE_INLINE __device__ inline __attribute__((always_inline))
 #define __HALF2_TO_UI(var) *(reinterpret_cast<unsigned int *>(&(var)))
@@ -262,40 +272,51 @@ std::vector<Tensor> batched_embedding_forward_cuda(TensorList weights,
                                     int64_t L_max,
                                     int64_t BT_block_size,
                                     bool shmem) {
+  ncclComm_t comms[2];
   int num_devices = weights.size();
+  int device_list[num_devices] = {0};
+  for(int dev_id =0;dev_id<num_devices; dev_id++)
+    device_list[dev_id] = weights[dev_id].get_device();
+  for(int iter = 0; iter<num_devices; iter++)
+    printf("%d\n", device_list[iter]);
+
+  NCCLCHECK(ncclCommInitAll(comms, num_devices, device_list));
+
   auto output_vec = std::vector<Tensor>();                     
+  const auto D = weights[0].size(1);
+  const auto T = table_offsets[0].size(0);
+  const auto B = (offsets[0].size(0)-1)/T;
+  AT_ASSERT(D > 0);
+  AT_ASSERT(T > 0);
+  AT_ASSERT(B > 0);
+  AT_ASSERT(BT_block_size != 0);
+  if ((B * T) % BT_block_size != 0) {
+    BT_block_size = 1;
+  }
+  AT_ASSERT((B * T) % BT_block_size == 0);
+  AT_ASSERT(D % 4 == 0);
+  const dim3 threads(std::min(D/4, kMaxThreads/BT_block_size), BT_block_size);
+  const dim3 blocks((B*T)/BT_block_size);
+  printf("T=%ld, D=%ld,B=%ld\n", T, D, B);
+
   for(int dev_id = 0; dev_id < num_devices; dev_id++)
   {
-    int reside_device = weights[dev_id].get_device();
-    const auto T = table_offsets[dev_id].size(0);
-    const auto D = weights[dev_id].size(1);
-    AT_ASSERT(dev_id == reside_device);
-    AT_ASSERT(T > 0);
-    AT_ASSERT(D > 0);
-    const auto B = (offsets[dev_id].size(0)-1)/T;
-    AT_ASSERT(B > 0);
-    printf("weights %d, reside on device %d\nT=%ld, D=%ld,B=%ld\n", dev_id, reside_device, T, D, B);
-
-    AT_ASSERT(BT_block_size != 0);
-    if ((B * T) % BT_block_size != 0) {
-      BT_block_size = 1;
-    }
-    AT_ASSERT((B * T) % BT_block_size == 0);
-    AT_ASSERT(D % 4 == 0);
-    const dim3 threads(std::min(D/4, kMaxThreads/BT_block_size), BT_block_size);
-    const dim3 blocks((B*T)/BT_block_size);
-    
-    cudaSetDevice(reside_device);
+    AT_ASSERT(dev_id == weights[dev_id].get_device());
+        
+    cudaSetDevice(dev_id);
     auto tmp_output = empty({B, T, D}, weights[dev_id].options());
     output_vec.push_back(tmp_output);
-    Device device(kCUDA, reside_device);
+    Device device(kCUDA, dev_id);
     Tensor input_indices = indices[dev_id].to(device);
     Tensor input_offsets = offsets[dev_id].to(device);
-    std::cout << weights[dev_id].options() << std::endl;
-    std::cout << table_offsets[dev_id].options() << std::endl;
-    std::cout << input_indices.options() << std::endl;
-    std::cout << input_offsets.options() << std::endl;
-    std::cout << output_vec[dev_id].options() << std::endl;
+    /*
+      std::cout << weights[dev_id].options() << std::endl;
+      std::cout << table_offsets[dev_id].options() << std::endl;
+      std::cout << input_indices.options() << std::endl;
+      std::cout << input_offsets.options() << std::endl;
+      std::cout << output_vec[dev_id].options() << std::endl;
+    */
+    
     AT_DISPATCH_FLOATING_TYPES(weights[dev_id].type(), "kernel", 
      ([&] {
         batched_embedding_forward_kernel_1<scalar_t, false><<<blocks, threads>>>
