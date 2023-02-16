@@ -144,7 +144,7 @@ class DLRM_Net(nn.Module):
     ):
         assert managed in (EmbeddingLocation.DEVICE, EmbeddingLocation.HOST_MAPPED)
         numTables = len(self.ln_emb)
-        self.emb_l = [torch.nn.EmbeddingBag(self.ln_emb[i], self.m_spa, mode="sum", sparse=True) for i in range(numTables)]
+        self.emb_l = [torch.nn.EmbeddingBag(self.ln_emb[i], self.m_spa, mode="sum", sparse=True, dtype=torch.float32) for i in range(numTables)]
         if managed == EmbeddingLocation.DEVICE:
            for t in self.emb_l:
                 t.cuda()
@@ -303,21 +303,9 @@ class DLRM_Net(nn.Module):
                 indices,
                 offsets
             )
-            min_gather_size = self.all_table_offsets[0].shape[0]
-            for i in range(self.ndevices):
-                min_gather_size = min(min_gather_size, self.all_table_offsets[i].shape[0])
-
-            gather_ly = []
-            for i in range(self.ndevices):
-                gather_ly.append(ly[i].reshape(-1)[0:(x.shape[0]*min_gather_size*self.m_spa)])
-            gather_out = [torch.zeros(x.shape[0]*min_gather_size*self.m_spa*self.ndevices, device=i, dtype=ly[0].dtype) for i in range(self.ndevices)]
-
-            for i in range(self.ndevices):
-                gather_ly[i] = gather_ly[i].reshape(x.shape[0], min_gather_size, self.m_spa)
-                gather_out[i] = gather_out[i].reshape(x.shape[0], self.ndevices*min_gather_size, self.m_spa)
-            nccl.all_gather(gather_ly, gather_out)
+            ly[0] = ly[0].reshape(x.shape[0], -1, self.m_spa)
         with record_function("module::forward_pass::interaction"):
-            z = self.interact_features(x, [k for k in gather_out[0]])
+            z = self.interact_features(x, [k for k in ly[0]])
         with record_function("module::forward_pass::top_mlp"):
             p = self.apply_mlp(z, self.top_l)
         return p

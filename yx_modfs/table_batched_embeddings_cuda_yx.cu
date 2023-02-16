@@ -248,20 +248,64 @@ __global__ void batched_embedding_forward_kernel_1(
   }
 }
 
-template<typename scalar_t, bool shared_indices, typename F>
+template <typename scalar_t, bool shared_indices, typename F>
 __global__ void batched_embedding_forward_kernel_2(
-  const PackedTensorAccessor32<scalar_t, 2, RestrictPtrTraits> weights,
-  const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> table_offsets,
-  const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> indices,
-  const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits> offsets,
-  PackedTensorAccessor32<scalar_t, 3, RestrictPtrTraits> output,
-  int32_t L_max,
-  F f) {
-  if(threadIdx.x + blockIdx.x*blockDim.x== 0) {
-    printf("hello from tensor:\n");
-    printf("%f, %d, %d, %d, %f\n", 
-      weights[0][0], table_offsets[0], indices[0], offsets[0], output[0][0][0]);
-    printf("finish!\n");
+    // [\sum_t E_t][D]
+    const PackedTensorAccessor32<scalar_t, 2, RestrictPtrTraits> weights,
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        table_offsets, // [T]
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        indices, // [N = \sum_{b,t} L_{b,t} total indices, i.e. flattened
+                 // [T][B][L]
+    const PackedTensorAccessor32<int32_t, 1, RestrictPtrTraits>
+        offsets, // [T x B + 1]
+    // offsets = cumsum([0] + lengths.contiguous()), where lengths L is [T][.
+    //PackedTensorAccessor32<scalar_t, 3, RestrictPtrTraits>
+    scalar_t * __restrict__
+        output, // [B][T][D],
+    int32_t L_max,
+    F f) {
+
+  extern __shared__ int32_t shmem_indices[];
+
+  const int32_t T = table_offsets.size(0);
+  const int32_t D = weights.size(1);
+  const int32_t B = (offsets.size(0)-1)/T;
+
+  int32_t b_t = blockIdx.x * blockDim.y + threadIdx.y;
+  int32_t t = b_t / B;
+  int32_t b = b_t % B;
+
+  const int32_t table_offset = table_offsets[t];
+  const int32_t indices_start = offsets[t * B + b];
+  const int32_t indices_end = offsets[t * B + b + 1];
+  int32_t L = indices_end - indices_start;
+
+  if (shared_indices) {
+    int32_t shmem_offset = threadIdx.y * L_max;
+    for (int32_t i = threadIdx.x; i < L; i += blockDim.x) {
+      shmem_indices[shmem_offset + i] = __ldg(&indices[indices_start + i]);
+    }
+    __syncthreads();
+    for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
+      Vec4T<scalar_t> sum;
+      for (int32_t l = 0; l < L; ++l) {
+        auto idx = shmem_indices[shmem_offset + l];
+        Vec4T<scalar_t> weight((&weights[table_offset + idx][0]) + d * 4);
+        f.accumulate(sum, weight, indices_start + l);
+      }
+      sum.store(output+b*T*D+t*D + d*4);
+    }
+  } else {
+    for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
+      Vec4T<scalar_t> sum;
+      for (int32_t l = 0; l < L; ++l) {
+        auto idx = __ldg(&indices[indices_start + l]);
+        Vec4T<scalar_t> weight((&weights[table_offset + idx][0]) + d * 4);
+        f.accumulate(sum, weight, indices_start + l);
+      }
+      sum.store(output+b*T*D+t*D + d*4);
+    }
   }
 }
 
@@ -305,7 +349,7 @@ std::vector<Tensor> batched_embedding_forward_cuda(TensorList weights,
   {
     int dev_id = device_list[iter];
     cudaSetDevice(dev_id);
-    auto tmp_output = empty({B, T, D}, weights[iter].options());
+    auto tmp_output = empty({num_devices, B, T, D}, weights[iter].options());
     output_vec.push_back(tmp_output);
     Device device(kCUDA, dev_id);
     Tensor input_indices = indices[iter].to(device);
@@ -320,12 +364,13 @@ std::vector<Tensor> batched_embedding_forward_cuda(TensorList weights,
     
     AT_DISPATCH_FLOATING_TYPES(weights[iter].type(), "kernel", 
      ([&] {
-        batched_embedding_forward_kernel_1<scalar_t, false><<<blocks, threads, 0, s[iter]>>>
+
+        batched_embedding_forward_kernel_2<scalar_t, false><<<blocks, threads, 0, s[iter]>>>
 	      ((weights[iter]).packed_accessor32<scalar_t, 2, RestrictPtrTraits>(),
          (table_offsets[iter]).packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
          input_indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
          input_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-         output_vec[iter].packed_accessor32<scalar_t, 3, RestrictPtrTraits>(),
+         ((scalar_t *)output_vec[iter].data_ptr())+iter*B*T*D,
          static_cast<int32_t>(L_max), UnweightedForward<scalar_t>()
         );
     }));
@@ -336,6 +381,18 @@ std::vector<Tensor> batched_embedding_forward_cuda(TensorList weights,
   {
     AT_CUDA_CHECK(cudaSetDevice(device_list[iter]));
     AT_CUDA_CHECK(cudaStreamSynchronize(s[iter]));
+  }
+
+  NCCLCHECK(ncclGroupStart());
+  // in-place allgether:
+  // ncclAllGather(data+rank*sendcount, data, sendcount, datatype, op, comm, stream);
+  for (int i=0; i<num_devices; i++)
+    NCCLCHECK(ncclAllGather((const void *)(output_vec[i].data<float>()+i*B*T*D), (void *)(output_vec[i].data<float>()), B*T*D, ncclFloat,comms[i], s[i]));
+  NCCLCHECK(ncclGroupEnd());
+
+  for (int i=0; i<num_devices; i++) {
+    AT_CUDA_CHECK(cudaSetDevice(device_list[i]));
+    AT_CUDA_CHECK(cudaStreamSynchronize(s[i]));
   }
   return output_vec;
 }
