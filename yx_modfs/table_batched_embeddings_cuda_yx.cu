@@ -377,11 +377,11 @@ std::vector<Tensor> batched_embedding_forward_cuda(TensorList weights,
     AT_CUDA_CHECK(cudaGetLastError());
   }
 
-  for(int iter=0; iter<num_devices; iter++)
-  {
-    AT_CUDA_CHECK(cudaSetDevice(device_list[iter]));
-    AT_CUDA_CHECK(cudaStreamSynchronize(s[iter]));
-  }
+  //for(int iter=0; iter<num_devices; iter++)
+  //{
+  //  AT_CUDA_CHECK(cudaSetDevice(device_list[iter]));
+  //  AT_CUDA_CHECK(cudaStreamSynchronize(s[iter]));
+  //}
 
   NCCLCHECK(ncclGroupStart());
   // in-place allgether:
