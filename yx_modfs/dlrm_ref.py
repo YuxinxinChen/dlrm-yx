@@ -311,9 +311,7 @@ class DLRM_Net(nn.Module):
                 indices,
                 offsets
             )
-            print("ly: ")
-            print(ly)
-            ly = torch.cat([i for i in ly], dim=1)
+            #ly = torch.cat([i for i in ly], dim=1)
             ly = ly.reshape(ly.shape[0], -1)
             past_time = time.time() - start_time
             print("embedding lookup time (in seconds): ", past_time)
