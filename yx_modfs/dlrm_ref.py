@@ -1,6 +1,7 @@
 import argparse
 import sys
 import enum
+import time
 
 import numpy as np
 import torch
@@ -288,7 +289,10 @@ class DLRM_Net(nn.Module):
         with record_function("module::forward_pass::bottom_mlp"):
             x = self.apply_mlp(dense_input, self.bot_l)
         with record_function("module::forward_pass::embedding_lookups"):
+            start_time = time.time()
             ly = self.apply_emb(indices, offsets)
+            past_time = time.time()-start_time
+            print("embedding lookup time (in seconds): ", past_time)
         with record_function("module::forward_pass::interaction"):
             z = self.interact_features(x, ly)
         with record_function("module::forward_pass::top_mlp"):
@@ -300,28 +304,18 @@ class DLRM_Net(nn.Module):
         with record_function("module::forwaard_pass::bottom_mlp"):
             x = self.apply_mlp(dense_input, self.bot_l)
         with record_function("module::forward_pass::embedding_lookups"):
+            start_time = time.time()
             ly = LookupFunction.apply(
                 self.all_embedding_weights,
                 self.all_table_offsets,
                 indices,
                 offsets
             )
-            #print(ly[0])
-            #print(ly[0].shape)
-
-            #ly[0] = ly[0].reshape(x.shape[0], -1, self.m_spa)
             ly[0] = torch.cat([i for i in ly[0]], dim=1)
             ly[0] = ly[0].reshape(ly[0].shape[0], -1)
-            #print(ly[0].shape)
+            past_time = time.time() - start_time
+            print("embedding lookup time (in seconds): ", past_time)
         with record_function("module::forward_pass::interaction"):
-            #print(ly[0].shape)
-            #tmp = [i for i in ly[0]]
-            #print(len(tmp))
-            #print(tmp[0].shape)
-            #tmp = torch.cat(tmp, dim=1)
-            ##tmp.reshape()
-            #print(tmp.shape)
-            #print("-----------")
             z = self.interact_features(x, ly[0])
         with record_function("module::forward_pass::top_mlp"):
             p = self.apply_mlp(z, self.top_l)
@@ -445,7 +439,11 @@ def run():
             #print(offsets)
             #print("indices:")
             #print(indices)
+        start_time = time.time()
         out = dlrm(dense_x, indices, offsets)
+        end_time = time.time()
+        forward_time = end_time-start_time
+        print("forward time (in second): ", forward_time)
         print(out)
 
 if __name__ == "__main__":

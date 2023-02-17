@@ -351,9 +351,9 @@ std::vector<Tensor> batched_embedding_forward_cuda(TensorList weights,
     cudaSetDevice(dev_id);
     auto tmp_output = empty({num_devices, B, T, D}, weights[iter].options());
     output_vec.push_back(tmp_output);
-    Device device(kCUDA, dev_id);
-    Tensor input_indices = indices[iter].to(device);
-    Tensor input_offsets = offsets[iter].to(device);
+    //Device device(kCUDA, dev_id);
+    //Tensor input_indices = indices[iter].to(device);
+    //Tensor input_offsets = offsets[iter].to(device);
     /*
       std::cout << weights[dev_id].options() << std::endl;
       std::cout << table_offsets[dev_id].options() << std::endl;
@@ -368,8 +368,10 @@ std::vector<Tensor> batched_embedding_forward_cuda(TensorList weights,
         batched_embedding_forward_kernel_2<scalar_t, false><<<blocks, threads, 0, s[iter]>>>
 	      ((weights[iter]).packed_accessor32<scalar_t, 2, RestrictPtrTraits>(),
          (table_offsets[iter]).packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-         input_indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
-         input_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+         //input_indices.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+         //input_offsets.packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+         indices[iter].packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
+         offsets[iter].packed_accessor32<int32_t, 1, RestrictPtrTraits>(),
          ((scalar_t *)output_vec[iter].data_ptr())+iter*B*T*D,
          static_cast<int32_t>(L_max), UnweightedForward<scalar_t>()
         );
