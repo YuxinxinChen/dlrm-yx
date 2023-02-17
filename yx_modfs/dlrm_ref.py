@@ -279,7 +279,10 @@ class DLRM_Net(nn.Module):
         return [self.emb_l[i](indices[i], offsets[i]) for i in range(len(self.ln_emb))]
 
     def interact_features(self, x, ly):
-        return torch.cat(([x]+ly), dim=1)
+        if isinstance(ly, list):
+            return torch.cat(([x]+ly), dim=1)
+        elif torch.is_tensor(ly):
+            return torch.cat((x, ly), dim=1)
 
     def sequential_forward(self, dense_input, indices, offsets):
         with record_function("module::forward_pass::bottom_mlp"):
@@ -303,9 +306,23 @@ class DLRM_Net(nn.Module):
                 indices,
                 offsets
             )
-            ly[0] = ly[0].reshape(x.shape[0], -1, self.m_spa)
+            #print(ly[0])
+            #print(ly[0].shape)
+
+            #ly[0] = ly[0].reshape(x.shape[0], -1, self.m_spa)
+            ly[0] = torch.cat([i for i in ly[0]], dim=1)
+            ly[0] = ly[0].reshape(ly[0].shape[0], -1)
+            #print(ly[0].shape)
         with record_function("module::forward_pass::interaction"):
-            z = self.interact_features(x, [k for k in ly[0]])
+            #print(ly[0].shape)
+            #tmp = [i for i in ly[0]]
+            #print(len(tmp))
+            #print(tmp[0].shape)
+            #tmp = torch.cat(tmp, dim=1)
+            ##tmp.reshape()
+            #print(tmp.shape)
+            #print("-----------")
+            z = self.interact_features(x, ly[0])
         with record_function("module::forward_pass::top_mlp"):
             p = self.apply_mlp(z, self.top_l)
         return p
@@ -375,7 +392,7 @@ def run():
     parser.add_argument("--rand-seed", type=int, default=12321) 
 
     parser.add_argument("--arch-mlp-bot", type=dash_separated_ints, default="4-3-2")
-    parser.add_argument("--arch-mlp-top", type=dash_separated_ints, default="10-2-1")
+    parser.add_argument("--arch-mlp-top", type=dash_separated_ints, default="2-1")
 
     global args
     args = parser.parse_args()
@@ -384,7 +401,7 @@ def run():
     ln_top = np.fromstring(args.arch_mlp_top, dtype=int, sep="-")
     ln_bot = np.fromstring(args.arch_mlp_bot, dtype=int, sep="-")
     use_gpu = args.use_gpu and torch.cuda.is_available()
-
+    ln_top = np.insert(ln_top, 0, args.sparse_feature_size*len(ln_emb)+ln_bot[-1])
     assert(ln_top[0] == args.sparse_feature_size*len(ln_emb)+ln_bot[-1])
 
     ndevices = -1
@@ -394,9 +411,6 @@ def run():
         ndevices = args.world_size
     
     dlrm = DLRM_Net(args.sparse_feature_size, ln_emb, ln_bot,ln_top, ndevices)
-    #if ndevices == 1:
-    #    print(dlrm.emb_l[0].weight.data)
-    #    print(dlrm.emb_l[1].weight.data)
     #print(dlrm.top_l)
     #print(next(dlrm.top_l.parameters()).is_cuda)
     #print(dlrm.bot_l)
@@ -427,10 +441,10 @@ def run():
                 for i in range(len(indices)):
                     indices[i] = indices[i].cuda()
                     offsets[i] = offsets[i].cuda()
-            print("offsets:")
-            print(offsets)
-            print("indices:")
-            print(indices)
+            #print("offsets:")
+            #print(offsets)
+            #print("indices:")
+            #print(indices)
         out = dlrm(dense_x, indices, offsets)
         print(out)
 

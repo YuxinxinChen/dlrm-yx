@@ -343,7 +343,7 @@ std::vector<Tensor> batched_embedding_forward_cuda(TensorList weights,
   AT_ASSERT(D % 4 == 0);
   const dim3 threads(std::min(D/4, kMaxThreads/BT_block_size), BT_block_size);
   const dim3 blocks((B*T)/BT_block_size);
-  printf("T=%ld, D=%ld,B=%ld\n", T, D, B);
+  //printf("T=%ld, D=%ld,B=%ld\n", T, D, B);
 
   for(int iter = 0; iter < num_devices; iter++)
   {
