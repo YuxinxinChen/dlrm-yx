@@ -1,7 +1,7 @@
 #include <torch/extension.h>
 #include <iostream>
 
-std::vector<torch::Tensor> batched_embedding_forward_cuda(torch::TensorList weights,
+torch::Tensor batched_embedding_forward_cuda(torch::TensorList weights,
                                     torch::TensorList table_offsets,
                                     torch::TensorList offsets, torch::TensorList indices,
                                     int64_t L_max,
