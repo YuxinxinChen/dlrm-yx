@@ -11,6 +11,8 @@ import torch.cuda.nccl as nccl
 
 sys.path.append('/home/yuxin420/dlrm-yx/yx_modfs/build/lib.linux-x86_64-cpython-310')
 
+lookup_time = 0
+
 class EmbeddingLocation(enum.Enum):
     DEVICE = 0
     HOST_MAPPED = 1
@@ -314,6 +316,8 @@ class DLRM_Net(nn.Module):
             ly[0] = torch.cat([i for i in ly[0]], dim=1)
             ly[0] = ly[0].reshape(ly[0].shape[0], -1)
             past_time = time.time() - start_time
+            global lookup_time
+            lookup_time = lookup_time + past_time
             print("embedding lookup time (in seconds): ", past_time)
         with record_function("module::forward_pass::interaction"):
             z = self.interact_features(x, ly[0])
@@ -416,6 +420,7 @@ def run():
     #dataset.print_sparse()
     #dataset.print_dens()
 
+    forward_time = 0.0
     for bid in range(dataset.num_batches):
         print("-------------batch %d------------" % bid)
         indices = []
@@ -442,9 +447,10 @@ def run():
         start_time = time.time()
         out = dlrm(dense_x, indices, offsets)
         end_time = time.time()
-        forward_time = end_time-start_time
-        print("forward time (in second): ", forward_time)
-        print(out)
+        forward_time = forward_time + (end_time-start_time)
+        #print(out)
+    print("forward time (in second): ", forward_time)
+    print("lookup time (in seconds): ", lookup_time/args.num_batches)
 
 if __name__ == "__main__":
     run()
