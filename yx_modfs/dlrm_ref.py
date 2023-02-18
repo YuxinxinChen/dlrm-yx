@@ -313,14 +313,14 @@ class DLRM_Net(nn.Module):
                 indices,
                 offsets
             )
-            ly[0] = torch.cat([i for i in ly[0]], dim=1)
-            ly[0] = ly[0].reshape(ly[0].shape[0], -1)
+            #ly = torch.cat([i for i in ly], dim=1)
+            ly = ly.reshape(ly.shape[0], -1)
             past_time = time.time() - start_time
             global lookup_time
             lookup_time = lookup_time + past_time
             print("embedding lookup time (in seconds): ", past_time)
         with record_function("module::forward_pass::interaction"):
-            z = self.interact_features(x, ly[0])
+            z = self.interact_features(x, ly)
         with record_function("module::forward_pass::top_mlp"):
             p = self.apply_mlp(z, self.top_l)
         return p
