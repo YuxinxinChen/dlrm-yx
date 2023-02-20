@@ -13,7 +13,7 @@ if torch.cuda.is_available():
         [ 'batched_forward.cpp', 'table_batched_embeddings_cuda_yx.cu'],
         #include_dirs=['/home/yuxin420/pkg/nccl/build/include'],
         include_dirs=[nccl_include_path],
-        extra_compile_args={'nvcc': ['-O2']}
+        extra_compile_args={'nvcc': ['-O2', '-lineinfo', '-Xptxas', '-v']}
     )
     ext_modules.append(extension)
 

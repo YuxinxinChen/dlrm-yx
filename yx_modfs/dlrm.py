@@ -102,8 +102,8 @@ class LookupFunction(torch.autograd.Function):
     ):
         ndevices = len(weights)
         embedding_dimension = weights[0].shape[1]
-        BT_block_size = int(max(512/embedding_dimension, 1))
         L_max = int(embedding_dimension/4)*4
+        BT_block_size = int(max(2048/(L_max/4), 1))
 
         import table_batched_embeddings_yx.batched_forward
         res = torch.ops.batched_forward.forward(
@@ -115,7 +115,6 @@ class LookupFunction(torch.autograd.Function):
             BT_block_size,
             False
         )
-        
         return res
 
 class DLRM_Net(nn.Module):
@@ -270,7 +269,7 @@ class DLRM_Net(nn.Module):
             past_time = time.time()-start_time
             global lookup_time
             lookup_time = lookup_time + past_time
-            print("embedding lookup time (in seconds): ", past_time)
+            print("embedding lookup time (in ms): ", past_time*1000.0)
         with record_function("module::forward_pass::interaction"):
             z = self.interact_features(x, ly)
         with record_function("module::forward_pass::top_mlp"):
@@ -293,7 +292,7 @@ class DLRM_Net(nn.Module):
             past_time = time.time() - start_time
             global lookup_time
             lookup_time = lookup_time + past_time
-            print("embedding lookup time (in seconds): ", past_time)
+            print("embedding lookup time (in ms): ", past_time*1000.0)
         with record_function("module::forward_pass::interaction"):
             z = self.interact_features(x, ly)
         with record_function("module::forward_pass::top_mlp"):
@@ -417,9 +416,14 @@ def run():
         out = dlrm(dense_x, indices, offsets)
         end_time = time.time()
         forward_time = forward_time + (end_time-start_time)
-        #print(out)
+        filename = str(args.world_size)+"gpu.txt"
+        f = open(filename, "w")
+        for o in out:
+            to = o.detach()
+            f.write(str(to)+"\n")
+        f.close()
     print("forward time (in second): ", forward_time)
-    print("embedding lookup time (in seconds): ", lookup_time/args.num_batches)
+    print("embedding lookup time (in ms): ", lookup_time/args.num_batches*1000.0)
 
 if __name__ == "__main__":
     run()

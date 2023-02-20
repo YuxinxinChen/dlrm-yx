@@ -249,6 +249,7 @@ __global__ void batched_embedding_forward_kernel_1(
 }
 
 template <typename scalar_t, bool shared_indices, typename F>
+__launch_bounds__(1024,1)
 __global__ void batched_embedding_forward_kernel_2(
     const int n_gpus,
     const int gpu_id,
@@ -300,6 +301,7 @@ __global__ void batched_embedding_forward_kernel_2(
       sum.store(output+b*(T*n_gpus)*D+(T*gpu_id)*D + d*4);
     }
   } else {
+    if (b_t < B) {
     for (int32_t d = threadIdx.x; d * 4 < D; d += blockDim.x) {
       Vec4T<scalar_t> sum;
       for (int32_t l = 0; l < L; ++l) {
@@ -308,8 +310,11 @@ __global__ void batched_embedding_forward_kernel_2(
         f.accumulate(sum, weight, indices_start + l);
       }
       // ( B, GPUs*T, D)
-      //if(d == 0) printf("b %d(x%d), t*gpuid %d(x%d),  offsets: %d\n", b, (T*2*D),T*gpu_id, D, b*(T*2)*D+(T*gpu_id)*D);
+      //if(d == 0) 
+      //printf("b %d(x%d), t*gpuid %d(x%d),  offsets: %d\n", b, (T*2*D),T*gpu_id, D, b*(T*2)*D+(T*gpu_id)*D);
+      //printf("threads( %d, %d), blocks %d, b_t %d, t %d, b %d, d %d, out offsets %d (%d, %d, %d)\n", threadIdx.x, threadIdx.y, blockIdx.x, b_t, t, b, d, b*(T*n_gpus)*D+(T*gpu_id)*D + d*4, b, T*gpu_id, d);
       sum.store(output+b*(T*n_gpus)*D+(T*gpu_id)*D + d*4);
+    }
     }
   }
 }
@@ -321,6 +326,7 @@ Tensor batched_embedding_forward_cuda(TensorList weights,
                                     int64_t L_max,
                                     int64_t BT_block_size,
                                     bool shmem) {
+  //printf("Block_size %d, L_max %d\n", int(BT_block_size), int(L_max));
   int num_devices = weights.size();
   int device_list[num_devices] = {0};
   for(int dev_id =0;dev_id<num_devices; dev_id++)
@@ -332,15 +338,32 @@ Tensor batched_embedding_forward_cuda(TensorList weights,
   AT_ASSERT(D > 0);
   AT_ASSERT(T > 0);
   AT_ASSERT(B > 0);
-  AT_ASSERT(BT_block_size != 0);
-  if ((B * T) % BT_block_size != 0) {
-    BT_block_size = 1;
-  }
-  AT_ASSERT((B * T) % BT_block_size == 0);
+  //AT_ASSERT(BT_block_size != 0);
+  //if ((B * T) % BT_block_size != 0) {
+  //  BT_block_size = 1;
+  //}
+  //AT_ASSERT((B * T) % BT_block_size == 0);
   AT_ASSERT(D % 4 == 0);
-  const dim3 threads(std::min(D/4, kMaxThreads/BT_block_size), BT_block_size);
-  const dim3 blocks((B*T)/BT_block_size);
-  //printf("T=%ld, D=%ld,B=%ld\n", T, D, B);
+  AT_ASSERT(int(D/4) <= kMaxThreads);
+  int per_block_size = std::max(int(B*T/(80*4)), 1);
+  BT_block_size = kWarpSize/(D/4);
+  //printf("per_block_size %d, BT_block_size %d\n", per_block_size, int(BT_block_size));
+  if(per_block_size > BT_block_size) 
+    BT_block_size = kMaxThreads/(D/4);
+  const dim3 threads(D/4, BT_block_size);
+  //if( B > 80) {
+  //  BT_block_size = std::max(B*T/(80*4),1);
+  //  if(BT_block_size == 1) BT_block_size /= (D/4);
+  //}
+  //printf("%d\n", int(std::min(D/4, kMaxThreads/BT_block_size)));
+  //printf("BT_size %d\n", int(BT_block_size));
+  //const dim3 threads(std::min(D/4, kMaxThreads/BT_block_size), BT_block_size);
+  const dim3 blocks(std::ceil(float(B*T)/float(threads.y)));
+  //printf("%d\n",int(std::ceil(float(B*T)/float(threads.y))) );
+  //const dim3 threads(std::min(D/4, kMaxThreads/BT_block_size), BT_block_size);
+  //const dim3 blocks((B*T)/BT_block_size);
+  //const dim3 threads(std::min(D/4, kMaxThreads/BT_block_size), BT_block_size);
+  printf("T=%ld, D=%ld,B=%ld\nthread (%d, %d, %d), block (%d, %d, %d)\n", T, D, B, threads.x, threads.y, threads.z, blocks.x, blocks.y, blocks.z);
 
   cudaStream_t * s = (cudaStream_t *)malloc(sizeof(cudaStream_t)*num_devices);
   auto output = empty({B, num_devices*T, D}, weights[0].options());
