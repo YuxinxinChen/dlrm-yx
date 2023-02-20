@@ -338,31 +338,14 @@ Tensor batched_embedding_forward_cuda(TensorList weights,
   AT_ASSERT(D > 0);
   AT_ASSERT(T > 0);
   AT_ASSERT(B > 0);
-  //AT_ASSERT(BT_block_size != 0);
-  //if ((B * T) % BT_block_size != 0) {
-  //  BT_block_size = 1;
-  //}
-  //AT_ASSERT((B * T) % BT_block_size == 0);
   AT_ASSERT(D % 4 == 0);
   AT_ASSERT(int(D/4) <= kMaxThreads);
   int per_block_size = std::max(int(B*T/(80*4)), 1);
   BT_block_size = kWarpSize/(D/4);
-  //printf("per_block_size %d, BT_block_size %d\n", per_block_size, int(BT_block_size));
   if(per_block_size > BT_block_size) 
     BT_block_size = kMaxThreads/(D/4);
   const dim3 threads(D/4, BT_block_size);
-  //if( B > 80) {
-  //  BT_block_size = std::max(B*T/(80*4),1);
-  //  if(BT_block_size == 1) BT_block_size /= (D/4);
-  //}
-  //printf("%d\n", int(std::min(D/4, kMaxThreads/BT_block_size)));
-  //printf("BT_size %d\n", int(BT_block_size));
-  //const dim3 threads(std::min(D/4, kMaxThreads/BT_block_size), BT_block_size);
   const dim3 blocks(std::ceil(float(B*T)/float(threads.y)));
-  //printf("%d\n",int(std::ceil(float(B*T)/float(threads.y))) );
-  //const dim3 threads(std::min(D/4, kMaxThreads/BT_block_size), BT_block_size);
-  //const dim3 blocks((B*T)/BT_block_size);
-  //const dim3 threads(std::min(D/4, kMaxThreads/BT_block_size), BT_block_size);
   printf("T=%ld, D=%ld,B=%ld\nthread (%d, %d, %d), block (%d, %d, %d)\n", T, D, B, threads.x, threads.y, threads.z, blocks.x, blocks.y, blocks.z);
 
   cudaStream_t * s = (cudaStream_t *)malloc(sizeof(cudaStream_t)*num_devices);
