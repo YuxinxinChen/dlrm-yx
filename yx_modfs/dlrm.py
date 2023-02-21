@@ -416,12 +416,12 @@ def run():
         out = dlrm(dense_x, indices, offsets)
         end_time = time.time()
         forward_time = forward_time + (end_time-start_time)
-        filename = str(args.world_size)+"gpu.txt"
-        f = open(filename, "w")
-        for o in out:
-            to = o.detach()
-            f.write(str(to)+"\n")
-        f.close()
+        #filename = str(args.world_size)+"gpu.txt"
+        #f = open(filename, "w")
+        #for o in out:
+        #    to = o.detach()
+        #    f.write(str(to)+"\n")
+        #f.close()
     print("forward time (in second): ", forward_time)
     print("embedding lookup time (in ms): ", lookup_time/args.num_batches*1000.0)
 

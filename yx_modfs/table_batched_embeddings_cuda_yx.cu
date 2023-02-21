@@ -346,7 +346,7 @@ Tensor batched_embedding_forward_cuda(TensorList weights,
     BT_block_size = kMaxThreads/(D/4);
   const dim3 threads(D/4, BT_block_size);
   const dim3 blocks(std::ceil(float(B*T)/float(threads.y)));
-  printf("T=%ld, D=%ld,B=%ld\nthread (%d, %d, %d), block (%d, %d, %d)\n", T, D, B, threads.x, threads.y, threads.z, blocks.x, blocks.y, blocks.z);
+  //printf("T=%ld, D=%ld,B=%ld\nthread (%d, %d, %d), block (%d, %d, %d)\n", T, D, B, threads.x, threads.y, threads.z, blocks.x, blocks.y, blocks.z);
 
   cudaStream_t * s = (cudaStream_t *)malloc(sizeof(cudaStream_t)*num_devices);
   auto output = empty({B, num_devices*T, D}, weights[0].options());
