@@ -10,7 +10,7 @@ at::Tensor sparse_embedding_cuda_forward_offsets(
     at::Tensor offsets
 );
 
-void sparse_embedding_cuda_forward_all2all_nccl(at::Tensor embeddings);
+at::Tensor sparse_embedding_cuda_forward_all2all_nccl(at::Tensor embeddings);
 
 TORCH_LIBRARY(sparse_offset_forward, m) {
     m.def("forward", &sparse_embedding_cuda_forward_offsets);

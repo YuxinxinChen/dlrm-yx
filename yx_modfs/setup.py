@@ -5,6 +5,7 @@ import os
 
 NCCL_HOME = os.getenv('NCCL_HOME')
 nccl_include_path = NCCL_HOME+'/include'
+nccl_lib_path = NCCL_HOME+'/lib'
 ext_modules = []
 
 if torch.cuda.is_available():
@@ -13,6 +14,8 @@ if torch.cuda.is_available():
         [ 'batched_forward.cpp', 'table_batched_embeddings_cuda_yx.cu'],
         #include_dirs=['/home/yuxin420/pkg/nccl/build/include'],
         include_dirs=[nccl_include_path],
+        libraries=['nccl'],
+        library_dirs=[nccl_lib_path],
         extra_compile_args={'nvcc': ['-O2', '-lineinfo', '-Xptxas', '-v']}
     )
     ext_modules.append(extension)

@@ -1,5 +1,6 @@
 #include <ATen/AccumulateType.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <torch/csrc/cuda/device_set.h>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 //#include <ATen/cuda/Exceptions.h>
@@ -107,10 +108,10 @@ static ncclComm_t nccl_comm() {
     }
 
     // Initialize the communicator for the current rank
-    //NCCLCHECK(ncclGroupStart()); // not sure if it is needed
+    NCCLCHECK(ncclGroupStart()); // not sure if it is needed
     NCCLCHECK(
         ncclCommInitRank(&world_comm, std::get<1>(comm_size_rank), id, my_rank));
-    //NCCLCHECK(ncclGroupEnd());
+    NCCLCHECK(ncclGroupEnd());
   });
   return world_comm;
 }
@@ -261,8 +262,7 @@ at::Tensor sparse_embedding_cuda_forward_offsets(
 }
 
 
-//at::Tensor sparse_embedding_cuda_forward_all2all_nccl(
-void sparse_embedding_cuda_forward_all2all_nccl(
+at::Tensor sparse_embedding_cuda_forward_all2all_nccl(
   // [B][T // devices][D])
   at::Tensor embeddings) {
 
@@ -284,13 +284,13 @@ void sparse_embedding_cuda_forward_all2all_nccl(
   const int rank = std::get<2>(meta);
   const int world_size = std::get<1>(meta);
   if(world_size == 1)
-    return;
+    return embeddings;
+    //return;
   using namespace torch::cuda::nccl::detail;
 
   const auto B = embeddings.size(0);
   const auto T = embeddings.size(1) * world_size;
   const auto D = embeddings.size(2);
-  printf("call from c++, rank %d, world_size %d, B %d, T %d, D %d\n", rank, world_size, int(B), int(T), int(D));
   at::cuda::CUDAGuard device_guard(embeddings.get_device());
   AT_ASSERT(B % world_size == 0);
 
@@ -308,23 +308,24 @@ void sparse_embedding_cuda_forward_all2all_nccl(
   const auto rank_offset = count * ncclTypeSize(data_type);
   auto comm = nccl_comm();
 
-  /*
   AT_ASSERT(count == B * T * D / world_size / world_size);
   check_inputs({embeddings}, {all_to_all_output}, 1, 1);
   auto stream =
       at::cuda::getCurrentCUDAStream(embeddings.get_device()).stream();
-
   {
-    pybind11::gil_scoped_release no_gil;
-    AutoNcclGroup nccl_group_guard;
+    //pybind11::gil_scoped_release no_gil;
+    //torch::cuda::nccl::AutoNcclGroup nccl_group_guard;
     for (int r = 0; r < world_size; r++) {
       // send all tables $t$ from rank $i$ to global batch chunk $j$.
       // recieve all tables $t$ from rank $j$ for global batch chunk $i$.
-      NCCL_CHECK(ncclSend(((uint8_t*)embeddings.data_ptr()) + r * rank_offset, count, data_type, r, comm, stream));
-      NCCL_CHECK(ncclRecv(((uint8_t*)all_to_all_output.data_ptr()) + r * rank_offset, count, data_type, r, comm, stream));
+      if (r == rank) 
+        AT_CUDA_CHECK(cudaMemcpy((uint8_t *)all_to_all_output.data_ptr()+r*rank_offset, (uint8_t *)embeddings.data_ptr()+r*rank_offset, rank_offset, cudaMemcpyDeviceToDevice));
+      else {
+        NCCLCHECK(ncclSend(((uint8_t*)embeddings.data_ptr()) + r * rank_offset, count, data_type, r, comm, stream));
+        NCCLCHECK(ncclRecv(((uint8_t*)all_to_all_output.data_ptr()) + r * rank_offset, count, data_type, r, comm, stream));
+      }
     }
   }
   auto transposed = all_to_all_output.transpose(1, 0);
   return transposed.contiguous().view({B / world_size, T, D});
-  */
 }
