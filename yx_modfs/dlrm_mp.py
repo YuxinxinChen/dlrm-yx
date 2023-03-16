@@ -17,6 +17,18 @@ def cleanup():
 def div_round_up(a, b):
     return int((a + b - 1) // b) * b
 
+def benchmark_torch_function(iters, f, *args):
+    f(*args)
+    torch.cuda.synchronize()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    for i in range(iters):
+        f(*args)
+    end_event.record()
+    torch.cuda.synchronize()
+    return (start_event.elapsed_time(end_event) * 1.0e-3) / iters
+
 def benchmark_partitioned_snn_forward(
                                     num_tables,
                                     num_embeddings,
@@ -27,7 +39,7 @@ def benchmark_partitioned_snn_forward(
                                     iters):
     assert batch_size % dist.get_world_size() == 0
     assert num_tables % dist.get_world_size() == 0
-    print("Benchmark on rank %d, num_tables %d, num_embeddings %d, embedding_dim %d, batch_size %d, dense_feature_dim %d, bag size %d" %(dist.get_rank(), num_tables, num_embeddings, embedding_dim, batch_size, dense_features_dim, bag_size))
+    #print("Benchmark on rank %d, num_tables %d, num_embeddings %d, embedding_dim %d, batch_size %d, dense_feature_dim %d, bag size %d" %(dist.get_rank(), num_tables, num_embeddings, embedding_dim, batch_size, dense_features_dim, bag_size))
 
     net = DistributedPartitionShardedSNN(num_tables, num_embeddings, embedding_dim, dense_features_dim)
     dense_features = torch.randn(batch_size// dist.get_world_size(), dense_features_dim, device=torch.cuda.current_device())
@@ -48,7 +60,12 @@ def benchmark_partitioned_snn_forward(
     #print(shared_offsets)
     #print(shared_sparse_features.size())
     #print(shared_sparse_features)
-    net.forward(dense_features, shared_sparse_features, shared_offsets)
+    def forward(dese_features, shared_sparse_features, shared_offsets):
+        return net.forward(dense_features, shared_sparse_features, shared_offsets)
+
+    dist.barrier()
+    time_per_batch = benchmark_torch_function(iters, forward, dense_features, shared_sparse_features, shared_offsets)
+    print("time (in sec): ", time_per_batch)
 
 def dash_separated_ints(value):
     vals = value.split("-")
@@ -62,6 +79,16 @@ def dash_separated_ints(value):
 
     return value
 
+def print_args(args):
+    print("--use-gpu = ", args.use_gpu)
+    print("--sparse-feature-size = ", args.sparse_feature_size)
+    print("--num-tables = ", args.num_tables)
+    print("--num-embeddings = ", args.num_embeddings)
+    print("--num-batches = ", args.num_batches)
+    print("--batches-size = ", args.batches_size)
+    print("--indices-per-lookup = ", args.indices_per_lookup)
+    print("--dense-feature-size = ", args.dense_feature_size)
+
 if __name__ == "__main__":
         ### parse arguments ###
     parser = argparse.ArgumentParser(
@@ -71,13 +98,14 @@ if __name__ == "__main__":
     parser.add_argument("--sparse-feature-size", type=int, default=4)    
     parser.add_argument("--num-tables", type=int, default=0)
     parser.add_argument(
-        "--num_embeddings", type=int, default=10
+        "--num-embeddings", type=int, default=10
     )
     parser.add_argument("--num-batches", type=int, default=2)    
     parser.add_argument("--batches-size", type=int, default=2)    
     parser.add_argument("--indices-per-lookup", type=int, default=3)    
     parser.add_argument("--rand-seed", type=int, default=12321) 
     parser.add_argument("--dense-feature-size", type=int, default=4)
+    parser.add_argument("--verbose", "-v", type=bool, default = False)
 
     global args 
     args = parser.parse_args()
@@ -100,7 +128,11 @@ if __name__ == "__main__":
         ndevices = world_size
         torch.cuda.set_device(world_rank)
 
-    print(f"I am {world_rank} of {world_size} in {hostname} current device {torch.cuda.current_device()}")
+    #print(f"I am {world_rank} of {world_size} in {hostname} current device {torch.cuda.current_device()}")
+    if world_rank == 0 and args.verbose == True:
+        print_args(args)
 
-    benchmark_partitioned_snn_forward(args.num_tables, args.num_embeddings, args.sparse_feature_size, args.dense_feature_size, args.batches_size, args.indices_per_lookup, 1)
+    benchmark_partitioned_snn_forward(args.num_tables, args.num_embeddings, args.sparse_feature_size, args.dense_feature_size, args.batches_size, args.indices_per_lookup, args.num_batches)
+
+    dist.destroy_process_group()
 

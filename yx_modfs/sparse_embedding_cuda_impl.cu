@@ -107,10 +107,19 @@ static ncclComm_t nccl_comm() {
       AT_ASSERT(op == MPI_SUCCESS);
     }
 
+    //ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+    //config.blocking = 0;
     // Initialize the communicator for the current rank
     NCCLCHECK(ncclGroupStart()); // not sure if it is needed
     NCCLCHECK(
         ncclCommInitRank(&world_comm, std::get<1>(comm_size_rank), id, my_rank));
+    
+    //ncclCommInitRankConfig(&world_comm, std::get<1>(comm_size_rank), id, my_rank, &config);
+    //ncclResult_t state;
+    //do {
+    //  NCCLCHECK(ncclCommGetAsyncError(world_comm, &state));
+    //  // Handle outside events, timeouts, progress, ...
+    //} while(state == ncclInProgress);
     NCCLCHECK(ncclGroupEnd());
   });
   return world_comm;
@@ -210,7 +219,7 @@ torch::Tensor sparse_embedding_cuda_forward_offsets_kernel(
     const int T_b = (T + T_t - 1) / T_t;
     const dim3 threads(D, T_t);
     const dim3 blocks(B, T_b);
-    printf("threads %d, %d, block %d, %d\n", threads.x, threads.y, blocks.x, blocks.y);
+    //printf("threads %d, %d, block %d, %d\n", threads.x, threads.y, blocks.x, blocks.y);
 
     AT_DISPATCH_FLOATING_TYPES(
         weights.type(), "sparse_embedding_cuda_forward_offsets", ([&] {
@@ -226,6 +235,7 @@ torch::Tensor sparse_embedding_cuda_forward_offsets_kernel(
   } else {
     const int threads = D;
     const dim3 blocks(B, T);
+    //printf("threads %d, block %d, %d\n", threads, blocks.x, blocks.y);
 
     AT_DISPATCH_FLOATING_TYPES(
         weights.type(), "sparse_embedding_cuda_forward_offsets", ([&] {
@@ -256,7 +266,7 @@ at::Tensor sparse_embedding_cuda_forward_offsets(
   const int world_size = std::get<1>(meta);
   at::cuda::OptionalCUDAGuard device_guard;
   device_guard.set_index(weights.get_device());
-  printf("I am here Rank %d, world %d, device %d\n", rank, world_size, int(weights.get_device()));
+  //printf("I am here Rank %d, world %d, device %d\n", rank, world_size, int(weights.get_device()));
   AT_CUDA_CHECK(cudaSetDevice(weights.get_device()));
   return sparse_embedding_cuda_forward_offsets_kernel(weights, indices, offsets);
 }
@@ -310,22 +320,31 @@ at::Tensor sparse_embedding_cuda_forward_all2all_nccl(
 
   AT_ASSERT(count == B * T * D / world_size / world_size);
   check_inputs({embeddings}, {all_to_all_output}, 1, 1);
-  auto stream =
-      at::cuda::getCurrentCUDAStream(embeddings.get_device()).stream();
+  cudaStream_t streams[world_size*2];
+  for(int i=0; i<world_size*2; i++) {
+    AT_CUDA_CHECK(cudaStreamCreateWithFlags(streams+i, cudaStreamNonBlocking));
+  }
+  //auto stream =
+  //    at::cuda::getCurrentCUDAStream(embeddings.get_device()).stream();
   {
     //pybind11::gil_scoped_release no_gil;
     //torch::cuda::nccl::AutoNcclGroup nccl_group_guard;
+    ncclGroupStart();
     for (int r = 0; r < world_size; r++) {
       // send all tables $t$ from rank $i$ to global batch chunk $j$.
       // recieve all tables $t$ from rank $j$ for global batch chunk $i$.
       if (r == rank) 
-        AT_CUDA_CHECK(cudaMemcpy((uint8_t *)all_to_all_output.data_ptr()+r*rank_offset, (uint8_t *)embeddings.data_ptr()+r*rank_offset, rank_offset, cudaMemcpyDeviceToDevice));
+        AT_CUDA_CHECK(cudaMemcpyAsync((uint8_t *)all_to_all_output.data_ptr()+r*rank_offset, (uint8_t *)embeddings.data_ptr()+r*rank_offset, rank_offset, cudaMemcpyDeviceToDevice, streams[r*2]));
       else {
-        NCCLCHECK(ncclSend(((uint8_t*)embeddings.data_ptr()) + r * rank_offset, count, data_type, r, comm, stream));
-        NCCLCHECK(ncclRecv(((uint8_t*)all_to_all_output.data_ptr()) + r * rank_offset, count, data_type, r, comm, stream));
+        NCCLCHECK(ncclSend(((uint8_t*)embeddings.data_ptr()) + r * rank_offset, count, data_type, r, comm, streams[r*2]));
+        NCCLCHECK(ncclRecv(((uint8_t*)all_to_all_output.data_ptr()) + r * rank_offset, count, data_type, r, comm, streams[r*2+1]));
       }
     }
+    ncclGroupEnd();
   }
+  for (int i=0; i<world_size*2; i++)
+    AT_CUDA_CHECK(cudaStreamSynchronize(streams[i]));
+
   auto transposed = all_to_all_output.transpose(1, 0);
   return transposed.contiguous().view({B / world_size, T, D});
 }

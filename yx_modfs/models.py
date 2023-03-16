@@ -125,7 +125,7 @@ class DistributedPartitionShardedSNN(nn.Module):
         super(DistributedPartitionShardedSNN, self).__init__()
         device = torch.cuda.current_device()
         self.dense_arch = DenseArch(dense_features_dim, embedding_dim).to(device)
-        print(f"Rank {dist.get_rank()}, nn {self.dense_arch._0.device}")
+        #print(f"Rank {dist.get_rank()}, nn {self.dense_arch._0.device}")
         assert num_tables % dist.get_world_size() == 0
         self.embedding_tables = UniformShardedEmbeddingBags(
             num_tables // dist.get_world_size(), num_embeddings, embedding_dim)
@@ -135,9 +135,10 @@ class DistributedPartitionShardedSNN(nn.Module):
     def forward(self, dense_features, partitioned_sparse_features, partitions_offsets):
         dense_projection, dense_embedding = self.dense_arch(dense_features)
         res = self.embedding_tables(partitioned_sparse_features, partitions_offsets)
-        print(res.detach())
-        torch.ops.sparse_offset_forward.all2all(res)
-    #    embeddings_x = All2AllFunction.apply(
-    #        self.embedding_tables(partitioned_sparse_features))
-    #    logits = self.over_arch(torch.cat([embeddings_x, dense_embedding.unsqueeze(1)], dim=1), dense_projection)
-    #    return logits
+        #print(res.detach())
+        embeddings_x = torch.ops.sparse_offset_forward.all2all(res)
+        #print(embedding_x)
+        #embeddings_x = All2AllFunction.apply(
+        #   self.embedding_tables(partitioned_sparse_features))
+        logits = self.over_arch(torch.cat([embeddings_x, dense_embedding.unsqueeze(1)], dim=1), dense_projection)
+        return logits
